@@ -72,7 +72,7 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *AcquireReply) error {
 	if args.Type == MAP {
 		t = &c.maps[args.TaskID]
 		c.mapDone++
-		c.reduces = append(c.reduces, Piece{args.Output, IDLE, -1})
+		// c.reduces = append(c.reduces, Piece{args.Output, IDLE, -1})
 	} else {
 		t = &c.reduces[args.TaskID]
 		c.reduceDone++

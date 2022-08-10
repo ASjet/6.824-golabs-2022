@@ -20,7 +20,7 @@ type TaskDoneArgs struct {
 	WorkerID int
 	Type     int
 	TaskID   int
-	Output   string
+	Output   []string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
