@@ -1,5 +1,7 @@
 package mr
 
+import "fmt"
+
 //
 // RPC definitions.
 //
@@ -7,13 +9,13 @@ package mr
 //
 
 // Add your RPC definitions here.
-type AcquireArgs struct {
+type RegisterReply struct {
 	WorkerID int
 }
 
-type AcquireReply struct {
-	Task    Task
-	NReduce int
+type PingArgs struct {
+	ID    int
+	State int
 }
 
 type TaskDoneArgs struct {
@@ -21,6 +23,10 @@ type TaskDoneArgs struct {
 	Type     int
 	TaskID   int
 	Output   []string
+}
+
+func (t *TaskDoneArgs) String() string {
+	return fmt.Sprintf("Done{worker_%d %s %d-%v}", t.WorkerID, taskname[t.Type], t.TaskID, t.Output)
 }
 
 // Cook up a unique-ish UNIX-domain socket name

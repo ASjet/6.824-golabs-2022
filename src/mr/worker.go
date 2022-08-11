@@ -9,12 +9,27 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
-var nReduce int
+var WorkerTask Task = TASK_WAIT
+var WorkerTaskMu sync.Mutex
 
-var workerID = os.Getpid()
+type Info struct {
+	ID    int
+	Sock  string
+	State int
+	mu    sync.Mutex
+}
+
+func (i *Info) SetState(state int) {
+	i.mu.Lock()
+	i.State = state
+	i.mu.Unlock()
+}
+
+var WorkerInfo Info
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -37,78 +52,194 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func registry() {
+	WorkerInfo.ID = -1
+	WorkerTaskMu.Lock()
+	WorkerTask.Type = WAIT
+	WorkerTaskMu.Unlock()
+	reply := RegisterReply{}
+	err := call("Coordinator.RegistryWorker", &WorkerInfo, &reply)
+	if err != nil {
+		log.Fatalf("[%d]register: %v", WorkerInfo.ID, err)
+	}
+	WorkerInfo.ID = reply.WorkerID
+	WorkerInfo.SetState(IDLE)
+	info("[%d]registry: Got worker id %d", WorkerInfo.ID, WorkerInfo.ID)
+}
+
+func ping() {
+	for {
+		t := Task{}
+		WorkerInfo.mu.Lock()
+		args := PingArgs{WorkerInfo.ID, WorkerInfo.State}
+		WorkerInfo.mu.Unlock()
+		err := call("Coordinator.Ping", &args, &t)
+		if err != nil {
+			log.Fatalf("[%d]ping: %v", WorkerInfo.ID, err)
+		}
+		if t.Type == EXIT {
+			info("[%d]ping:Received EXIT", WorkerInfo.ID)
+			os.Exit(0)
+		}
+		if !t.Read {
+			WorkerTaskMu.Lock()
+			WorkerTask = t
+			debug("[%d]ping: New %s\n", WorkerInfo.ID, WorkerTask)
+			WorkerInfo.SetState(WorkerTask.State())
+			WorkerTaskMu.Unlock()
+		}
+		time.Sleep(WAIT_DURATION)
+	}
+}
+
+func readTask(t *Task) {
+	WorkerTaskMu.Lock()
+	if !WorkerTask.Read {
+		debug("[%d]readTask: raw %s", WorkerInfo.ID, WorkerTask)
+		WorkerTask.CopyTo(t)
+		WorkerTask.Read = true
+	}
+	WorkerTaskMu.Unlock()
+}
+
+func done(t *Task, output []string) {
+	info("[%d]done: Task done: %v", WorkerInfo.ID, t)
+	args := TaskDoneArgs{WorkerInfo.ID, t.Type, t.ID, output}
+	reply := Task{}
+	err := call("Coordinator.TaskDone", &args, &reply)
+	WorkerTaskMu.Lock()
+	WorkerTask = reply
+	WorkerInfo.SetState(WorkerTask.State())
+	WorkerTaskMu.Unlock()
+	if err != nil {
+		log.Printf("[%d]RPC: TaskDone err: %v", WorkerInfo.ID, err)
+		registry()
+	}
+}
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	// Get filename
-	for t, e := acquireTask(); e == nil; {
+
+	// Register to coordinator
+	registry()
+	// Start pinger
+	go ping()
+
+	// Main loop
+LoopStart:
+	for {
+		t := Task{}
+		readTask(&t)
 		switch t.Type {
 		case MAP:
-			fmt.Printf("Got map task %v\n", t.Path)
-			intermediate := make([][]KeyValue, nReduce)
-			outputFiles := make([]string, nReduce)
+			info("[%d]Got %s", WorkerInfo.ID, t)
+			intermediate := make([][]KeyValue, t.NReduce)
+			outputFiles := make([]string, t.NReduce)
 
-			file, err := os.Open(t.Path)
-			if err != nil {
-				log.Printf("cannot open %v: %v", t.Path, err)
-			}
-			content, err := io.ReadAll(file)
-			if err != nil {
-				log.Printf("cannot read %v: %v", t.Path, err)
-			}
-			file.Close()
-
-			kva := mapf(t.Path, string(content))
-			sort.Sort(ByKey(kva))
-			for _, kv := range kva {
-				i := ihash(kv.Key) % nReduce
-				intermediate[i] = append(intermediate[i], kv)
-			}
-			for i, kva := range intermediate {
-				filename := fmt.Sprintf("mr-%d-%d", t.ID, i)
-				file, err := os.Create(filename)
+			for _, path := range t.Paths {
+				if !WorkerTask.Read {
+					break LoopStart
+				}
+				file, err := os.Open(path)
 				if err != nil {
-					log.Printf("cannot open %v: %v", file, err)
+					log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, path, err)
 				}
-				enc := json.NewEncoder(file)
+				content, err := io.ReadAll(file)
+				if err != nil {
+					log.Printf("[%d]cannot read %v: %v", WorkerInfo.ID, path, err)
+				}
+				file.Close()
+
+				// Call mapper
+				kva := mapf(path, string(content))
+				sort.Sort(ByKey(kva))
+
 				for _, kv := range kva {
-					enc.Encode(kv)
+					if !WorkerTask.Read {
+						break LoopStart
+					}
+					// hash partition
+					i := ihash(kv.Key) % t.NReduce
+					intermediate[i] = append(intermediate[i], kv)
 				}
-				outputFiles[i] = filename
+
+				for i, kva := range intermediate {
+					if !WorkerTask.Read {
+						break LoopStart
+					}
+					filename := fmt.Sprintf("mr-%d-%d", t.ID, i)
+					file, err := os.Create(filename)
+					if err != nil {
+						log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, file, err)
+					}
+					enc := json.NewEncoder(file)
+					for _, kv := range kva {
+						if !WorkerTask.Read {
+							break LoopStart
+						}
+						enc.Encode(kv)
+					}
+					outputFiles[i] = filename
+				}
 			}
-			t, e = done(t, outputFiles)
+			done(&t, outputFiles)
 		case REDUCE:
-			fmt.Printf("Got reduce task %v\n", t.Path)
+			info("[%d]Got %v", WorkerInfo.ID, t)
+			intermeidate := []KeyValue{}
+			// Read all intermediate kv pairs
+			for _, path := range t.Paths {
+				if !WorkerTask.Read {
+					break LoopStart
+				}
+				file, err := os.Open(path)
+				if err != nil {
+					log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, path, err)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					if !WorkerTask.Read {
+						break LoopStart
+					}
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermeidate = append(intermeidate, kv)
+				}
+			}
+			sort.Sort(ByKey(intermeidate))
+			tmpname := fmt.Sprintf("tmp-out-%d-%d", WorkerInfo.ID, t.ID)
+			ofile, _ := os.Create(tmpname)
+			for i := 0; i < len(intermeidate); {
+				if !WorkerTask.Read {
+					break LoopStart
+				}
+				j := i + 1
+				for j < len(intermeidate) && intermeidate[j].Key == intermeidate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermeidate[k].Value)
+				}
+				output := reducef(intermeidate[i].Key, values)
+				fmt.Fprintf(ofile, "%v %v\n", intermeidate[i].Key, output)
+
+				i = j
+			}
+			ofile.Close()
+			oname := fmt.Sprintf("mr-out-%d", t.ID)
+			os.Rename(tmpname, oname)
+			done(&t, []string{oname})
+		case EXIT:
+			info("[%d]Received EXIT", WorkerInfo.ID)
+			os.Exit(0)
+		default:
+			time.Sleep(WAIT_DURATION)
 		}
-		time.Sleep(time.Second)
-	}
-}
-
-func acquireTask() (Task, error) {
-	args := AcquireArgs{workerID}
-	reply := AcquireReply{}
-
-	err := call("Coordinator.AcquireTask", &args, &reply)
-	if err == nil {
-		nReduce = reply.NReduce
-		return reply.Task, nil
-	} else {
-		fmt.Printf("call failed!\n")
-		return Task{}, err
-	}
-}
-
-func done(t Task, output []string) (Task, error) {
-	args := TaskDoneArgs{workerID, t.Type, t.ID, output}
-	reply := AcquireReply{}
-	err := call("Coordinator.TaskDone", &args, &reply)
-	if err == nil {
-		return reply.Task, nil
-	} else {
-		fmt.Printf("call failed!\n")
-		return Task{}, err
 	}
 }
 
@@ -120,15 +251,8 @@ func call(rpcname string, args interface{}, reply interface{}) error {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Fatalf("[%d]dialing: %v", WorkerInfo.ID, err)
 	}
 	defer c.Close()
-
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return nil
-	}
-
-	fmt.Println(err)
-	return err
+	return c.Call(rpcname, args, reply)
 }
