@@ -2,6 +2,8 @@ package mr
 
 import (
 	"fmt"
+	"os"
+	"strconv"
 )
 
 //
@@ -50,5 +52,7 @@ func (t *TaskDoneArgs) String() string {
 // Can't use the current directory since
 // Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
-	return "./824-mr-cord"
+	s := "/var/tmp/824-mr-"
+	s += strconv.Itoa(os.Getuid())
+	return s
 }

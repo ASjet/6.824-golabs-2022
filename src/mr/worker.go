@@ -64,11 +64,10 @@ func (w *WorkerInfo) Registry() {
 
 // Run RPC server
 func (w *WorkerInfo) server() {
-	prefix := "worker_"
+	prefix := "/var/tmp/mr-worker-"
 	w.Sock = prefix + strconv.Itoa(os.Getpid())
 	rpc.Register(w)
 	rpc.HandleHTTP()
-	os.Remove(w.Sock)
 	l, e := net.Listen("unix", w.Sock)
 	if e != nil {
 		log.Fatalf("[%s]listen error: %v", w.Sock, e)
@@ -94,6 +93,7 @@ func (w *WorkerInfo) AssignNewTask(args *WorkerTask, reply *PingReply) error {
 	debug("[%s]AssignNewTask: received %s", w.Sock, args)
 	if args.Type == EXIT {
 		info("[%s]AssignNewTask: received EXIT", w.Sock)
+		os.Remove(w.Sock)
 		os.Exit(0)
 	}
 	w.mu.Lock()
@@ -188,10 +188,10 @@ LoopStart:
 				}
 
 				for i, kva := range intermediate {
-					tmpname := fmt.Sprintf("tmp-intermediate-%d-%d", worker.ID, t.ID)
+					tmpname := fmt.Sprintf("mr-tmpintermediate-%d-%d", worker.ID, t.ID)
 					ofile, err := os.Create(tmpname)
 					if err != nil {
-						log.Printf("[%s]cannot open %v: %v", worker.Sock, ofile, err)
+						log.Printf("[%s]cannot open %s: %v", worker.Sock, tmpname, err)
 					}
 					enc := json.NewEncoder(ofile)
 					for _, kv := range kva {
@@ -219,7 +219,7 @@ LoopStart:
 			for _, path := range t.Paths {
 				ifile, err := os.Open(path)
 				if err != nil {
-					log.Printf("[%s]cannot open %v: %v", worker.Sock, path, err)
+					log.Printf("[%s]cannot open %s: %v", worker.Sock, path, err)
 				}
 				dec := json.NewDecoder(ifile)
 				for {
@@ -235,7 +235,7 @@ LoopStart:
 				}
 			}
 			sort.Sort(ByKey(intermeidate))
-			tmpname := fmt.Sprintf("tmp-out-%d-%d", worker.ID, t.ID)
+			tmpname := fmt.Sprintf("mr-tmpout-%d-%d", worker.ID, t.ID)
 			ofile, _ := os.Create(tmpname)
 			for i := 0; i < len(intermeidate); {
 				j := i + 1
@@ -262,6 +262,7 @@ LoopStart:
 			worker.Done(t, []string{oname})
 		case EXIT:
 			info("[%s]Received EXIT", worker.Sock)
+			os.Remove(worker.Sock)
 			os.Exit(0)
 		default:
 			time.Sleep(WAIT_DURATION)
