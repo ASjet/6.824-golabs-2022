@@ -1,6 +1,8 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+)
 
 //
 // RPC definitions.
@@ -9,8 +11,12 @@ import "fmt"
 //
 
 // Add your RPC definitions here.
-type RegisterReply struct {
+type RegistryArgs struct {
+	Sock string
+}
+type RegistryReply struct {
 	WorkerID int
+	Sockname string
 }
 
 type PingArgs struct {
@@ -18,11 +24,21 @@ type PingArgs struct {
 	State int
 }
 
+type PingReply struct {
+	State    int
+	TaskType int
+	TaskID   int
+}
+
 type TaskDoneArgs struct {
 	WorkerID int
 	Type     int
 	TaskID   int
 	Output   []string
+}
+
+type TaskDoneReply struct {
+	SyncState int
 }
 
 func (t *TaskDoneArgs) String() string {

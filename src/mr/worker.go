@@ -6,30 +6,15 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"net/rpc"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
-
-var WorkerTask Task = TASK_WAIT
-var WorkerTaskMu sync.Mutex
-
-type Info struct {
-	ID    int
-	Sock  string
-	State int
-	mu    sync.Mutex
-}
-
-func (i *Info) SetState(state int) {
-	i.mu.Lock()
-	i.State = state
-	i.mu.Unlock()
-}
-
-var WorkerInfo Info
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -52,113 +37,149 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func registry() {
-	WorkerInfo.ID = -1
-	WorkerTaskMu.Lock()
-	WorkerTask.Type = WAIT
-	WorkerTaskMu.Unlock()
-	reply := RegisterReply{}
-	err := call("Coordinator.RegistryWorker", &WorkerInfo, &reply)
+type WorkerInfo struct {
+	// Do not need to hold lock here
+	Sock string
+	ID   int
+
+	// Need to hold lock when r/w
+	state  int
+	task   *WorkerTask
+	update bool
+
+	mu sync.Mutex
+}
+
+// Registry this worker to coordinator
+func (w *WorkerInfo) Registry() {
+	args := RegistryArgs{w.Sock}
+	reply := RegistryReply{}
+	err := call("Coordinator.RegistryWorker", &args, &reply)
 	if err != nil {
-		log.Fatalf("[%d]register: %v", WorkerInfo.ID, err)
+		log.Fatalf("[%s]register: %v", w.Sock, err)
 	}
-	WorkerInfo.ID = reply.WorkerID
-	WorkerInfo.SetState(IDLE)
-	info("[%d]registry: Got worker id %d", WorkerInfo.ID, WorkerInfo.ID)
+	w.ID = reply.WorkerID
+	w.task = TASK_WAIT
 }
 
-func ping() {
-	for {
-		t := Task{}
-		WorkerInfo.mu.Lock()
-		args := PingArgs{WorkerInfo.ID, WorkerInfo.State}
-		WorkerInfo.mu.Unlock()
-		err := call("Coordinator.Ping", &args, &t)
-		if err != nil {
-			log.Fatalf("[%d]ping: %v", WorkerInfo.ID, err)
-		}
-		if t.Type == EXIT {
-			info("[%d]ping:Received EXIT", WorkerInfo.ID)
-			os.Exit(0)
-		}
-		if !t.Read {
-			WorkerTaskMu.Lock()
-			WorkerTask = t
-			debug("[%d]ping: New %s\n", WorkerInfo.ID, WorkerTask)
-			WorkerInfo.SetState(WorkerTask.State())
-			WorkerTaskMu.Unlock()
-		}
-		time.Sleep(WAIT_DURATION)
+// Run RPC server
+func (w *WorkerInfo) server() {
+	prefix := "worker_"
+	w.Sock = prefix + strconv.Itoa(os.Getpid())
+	rpc.Register(w)
+	rpc.HandleHTTP()
+	os.Remove(w.Sock)
+	l, e := net.Listen("unix", w.Sock)
+	if e != nil {
+		log.Fatalf("[%s]listen error: %v", w.Sock, e)
 	}
+	go http.Serve(l, nil)
+	w.Registry()
 }
 
-func readTask(t *Task) {
-	WorkerTaskMu.Lock()
-	if !WorkerTask.Read {
-		debug("[%d]readTask: raw %s", WorkerInfo.ID, WorkerTask)
-		WorkerTask.CopyTo(t)
-		WorkerTask.Read = true
-	}
-	WorkerTaskMu.Unlock()
+// This is a RPC call
+// Coordinator ping worker to get health status
+func (w *WorkerInfo) Ping(args *PingArgs, reply *PingReply) error {
+	w.mu.Lock()
+	reply.State = w.state
+	reply.TaskType = w.task.Type
+	reply.TaskID = w.task.ID
+	w.mu.Unlock()
+	return nil
 }
 
-func done(t *Task, output []string) {
-	info("[%d]done: Task done: %v", WorkerInfo.ID, t)
-	args := TaskDoneArgs{WorkerInfo.ID, t.Type, t.ID, output}
-	reply := Task{}
+// This is a RPC call
+// Coordinator assign new task to worker
+func (w *WorkerInfo) AssignNewTask(args *WorkerTask, reply *PingReply) error {
+	debug("[%s]AssignNewTask: received %s", w.Sock, args)
+	if args.Type == EXIT {
+		info("[%s]AssignNewTask: received EXIT", w.Sock)
+		os.Exit(0)
+	}
+	w.mu.Lock()
+	w.task = args
+	w.update = true
+	w.state = args.State()
+	w.mu.Unlock()
+	reply.State = args.State()
+	return nil
+}
+
+func (w *WorkerInfo) Updated() bool {
+	defer w.mu.Unlock()
+	w.mu.Lock()
+	return w.update
+}
+
+func (w *WorkerInfo) ReadTask() *WorkerTask {
+	defer w.mu.Unlock()
+	w.mu.Lock()
+	if w.update {
+		task := w.task
+		w.update = false
+		return task
+	}
+	return TASK_WAIT
+}
+
+func (w *WorkerInfo) Done(t *WorkerTask, output []string) {
+	// CANNOT Set worker to IDLE here, or will intruduce race that cannot be detected
+
+	info("[%s]Done: %v", w.Sock, t)
+	args := TaskDoneArgs{w.ID, t.Type, t.ID, output}
+	reply := TaskDoneReply{}
 	err := call("Coordinator.TaskDone", &args, &reply)
-	WorkerTaskMu.Lock()
-	WorkerTask = reply
-	WorkerInfo.SetState(WorkerTask.State())
-	WorkerTaskMu.Unlock()
 	if err != nil {
-		log.Printf("[%d]RPC: TaskDone err: %v", WorkerInfo.ID, err)
-		registry()
+		log.Printf("[%s]RPC: TaskDone err: %v", w.Sock, err)
+		w.Registry()
+		w.Done(t, output)
 	}
+	w.mu.Lock()
+	w.state = reply.SyncState
+	debug("[%s]Done: Sync state to %s", w.Sock, statename[w.state])
+	w.mu.Unlock()
 }
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// Register to coordinator
-	registry()
-	// Start pinger
-	go ping()
+	// Your workera implementation here.
+	worker := WorkerInfo{}
+	// Start RPC server and register to coordinator
+	worker.server()
 
 	// Main loop
 LoopStart:
 	for {
-		t := Task{}
-		readTask(&t)
+		t := worker.ReadTask()
 		switch t.Type {
 		case MAP:
-			info("[%d]Got %s", WorkerInfo.ID, t)
+			info("[%s]Got %s", worker.Sock, t)
 			intermediate := make([][]KeyValue, t.NReduce)
 			outputFiles := make([]string, t.NReduce)
 
 			for _, path := range t.Paths {
-				if !WorkerTask.Read {
+				ifile, err := os.Open(path)
+				if err != nil {
+					log.Printf("[%s]cannot open %v: %v", worker.Sock, path, err)
+				}
+				content, err := io.ReadAll(ifile)
+				if err != nil {
+					log.Printf("[%s]cannot read %v: %v", worker.Sock, path, err)
+				}
+				ifile.Close()
+
+				if worker.Updated() {
 					break LoopStart
 				}
-				file, err := os.Open(path)
-				if err != nil {
-					log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, path, err)
-				}
-				content, err := io.ReadAll(file)
-				if err != nil {
-					log.Printf("[%d]cannot read %v: %v", WorkerInfo.ID, path, err)
-				}
-				file.Close()
 
 				// Call mapper
 				kva := mapf(path, string(content))
 				sort.Sort(ByKey(kva))
 
 				for _, kv := range kva {
-					if !WorkerTask.Read {
+					if worker.Updated() {
 						break LoopStart
 					}
 					// hash partition
@@ -167,56 +188,56 @@ LoopStart:
 				}
 
 				for i, kva := range intermediate {
-					if !WorkerTask.Read {
-						break LoopStart
-					}
-					filename := fmt.Sprintf("mr-%d-%d", t.ID, i)
-					file, err := os.Create(filename)
+					tmpname := fmt.Sprintf("tmp-intermediate-%d-%d", worker.ID, t.ID)
+					ofile, err := os.Create(tmpname)
 					if err != nil {
-						log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, file, err)
+						log.Printf("[%s]cannot open %v: %v", worker.Sock, ofile, err)
 					}
-					enc := json.NewEncoder(file)
+					enc := json.NewEncoder(ofile)
 					for _, kv := range kva {
-						if !WorkerTask.Read {
-							break LoopStart
-						}
 						enc.Encode(kv)
 					}
-					outputFiles[i] = filename
+					if worker.Updated() {
+						ofile.Close()
+						os.Remove(tmpname)
+						break LoopStart
+					}
+					ofile.Close()
+					oname := fmt.Sprintf("mr-%d-%d", t.ID, i)
+					os.Rename(tmpname, oname)
+					outputFiles[i] = oname
+				}
+				if worker.Updated() {
+					break LoopStart
 				}
 			}
-			done(&t, outputFiles)
+			worker.Done(t, outputFiles)
 		case REDUCE:
-			info("[%d]Got %v", WorkerInfo.ID, t)
+			info("[%s]Got %v", worker.Sock, t)
 			intermeidate := []KeyValue{}
 			// Read all intermediate kv pairs
 			for _, path := range t.Paths {
-				if !WorkerTask.Read {
-					break LoopStart
-				}
-				file, err := os.Open(path)
+				ifile, err := os.Open(path)
 				if err != nil {
-					log.Printf("[%d]cannot open %v: %v", WorkerInfo.ID, path, err)
+					log.Printf("[%s]cannot open %v: %v", worker.Sock, path, err)
 				}
-				dec := json.NewDecoder(file)
+				dec := json.NewDecoder(ifile)
 				for {
-					if !WorkerTask.Read {
-						break LoopStart
-					}
 					var kv KeyValue
 					if err := dec.Decode(&kv); err != nil {
 						break
 					}
 					intermeidate = append(intermeidate, kv)
 				}
-			}
-			sort.Sort(ByKey(intermeidate))
-			tmpname := fmt.Sprintf("tmp-out-%d-%d", WorkerInfo.ID, t.ID)
-			ofile, _ := os.Create(tmpname)
-			for i := 0; i < len(intermeidate); {
-				if !WorkerTask.Read {
+				ifile.Close()
+				if worker.Updated() {
 					break LoopStart
 				}
+			}
+			sort.Sort(ByKey(intermeidate))
+			tmpname := fmt.Sprintf("tmp-out-%d-%d", worker.ID, t.ID)
+			ofile, _ := os.Create(tmpname)
+			for i := 0; i < len(intermeidate); {
 				j := i + 1
 				for j < len(intermeidate) && intermeidate[j].Key == intermeidate[i].Key {
 					j++
@@ -229,13 +250,18 @@ LoopStart:
 				fmt.Fprintf(ofile, "%v %v\n", intermeidate[i].Key, output)
 
 				i = j
+				if worker.Updated() {
+					ofile.Close()
+					os.Remove(tmpname)
+					break LoopStart
+				}
 			}
 			ofile.Close()
 			oname := fmt.Sprintf("mr-out-%d", t.ID)
 			os.Rename(tmpname, oname)
-			done(&t, []string{oname})
+			worker.Done(t, []string{oname})
 		case EXIT:
-			info("[%d]Received EXIT", WorkerInfo.ID)
+			info("[%s]Received EXIT", worker.Sock)
 			os.Exit(0)
 		default:
 			time.Sleep(WAIT_DURATION)
@@ -251,7 +277,7 @@ func call(rpcname string, args interface{}, reply interface{}) error {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatalf("[%d]dialing: %v", WorkerInfo.ID, err)
+		log.Fatalf("dialing: %v", err)
 	}
 	defer c.Close()
 	return c.Call(rpcname, args, reply)
