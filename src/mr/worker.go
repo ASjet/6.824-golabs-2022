@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -47,19 +46,23 @@ type WorkerInfo struct {
 	task   *WorkerTask
 	update bool
 
-	mu sync.Mutex
+	cond *sync.Cond
 }
 
 // Registry this worker to coordinator
 func (w *WorkerInfo) Registry() {
 	args := RegistryArgs{w.Sock}
 	reply := RegistryReply{}
+	// Must hold lock until RPC return and set state
+	w.cond.L.Lock()
 	err := call("Coordinator.RegistryWorker", &args, &reply)
 	if err != nil {
 		log.Fatalf("[%s]register: %v", w.Sock, err)
 	}
 	w.ID = reply.WorkerID
 	w.task = TASK_WAIT
+	w.update = false
+	w.cond.L.Unlock()
 }
 
 // Run RPC server
@@ -76,46 +79,55 @@ func (w *WorkerInfo) server() {
 	w.Registry()
 }
 
+func (w *WorkerInfo) exit() {
+	os.Remove(w.Sock)
+	os.Exit(0)
+}
+
 // This is a RPC call
 // Coordinator ping worker to get health status
 func (w *WorkerInfo) Ping(args *PingArgs, reply *PingReply) error {
-	w.mu.Lock()
+	w.cond.L.Lock()
 	reply.State = w.state
 	reply.TaskType = w.task.Type
 	reply.TaskID = w.task.ID
-	w.mu.Unlock()
+	w.cond.L.Unlock()
 	return nil
 }
 
 // This is a RPC call
 // Coordinator assign new task to worker
 func (w *WorkerInfo) AssignNewTask(args *WorkerTask, reply *PingReply) error {
-	debug("[%s]AssignNewTask: received %s", w.Sock, args)
 	if args.Type == EXIT {
 		info("[%s]AssignNewTask: received EXIT", w.Sock)
-		os.Remove(w.Sock)
-		os.Exit(0)
+		w.exit()
 	}
-	w.mu.Lock()
+	defer w.cond.Broadcast()
+
+	w.cond.L.Lock()
 	w.task = args
-	w.update = true
 	w.state = args.State()
-	w.mu.Unlock()
-	reply.State = args.State()
+	w.update = true
+
+	debug("[%s]AssignNewTask: received %s", w.Sock, args)
+	reply.State = w.state
+	w.cond.L.Unlock()
+
 	return nil
 }
 
 func (w *WorkerInfo) Updated() bool {
-	defer w.mu.Unlock()
-	w.mu.Lock()
+	defer w.cond.L.Unlock()
+	w.cond.L.Lock()
 	return w.update
 }
 
 func (w *WorkerInfo) ReadTask() *WorkerTask {
-	defer w.mu.Unlock()
-	w.mu.Lock()
+	defer w.cond.L.Unlock()
+	w.cond.L.Lock()
 	if w.update {
 		task := w.task
+		w.state = task.State()
 		w.update = false
 		return task
 	}
@@ -123,7 +135,8 @@ func (w *WorkerInfo) ReadTask() *WorkerTask {
 }
 
 func (w *WorkerInfo) Done(t *WorkerTask, output []string) {
-	// CANNOT Set worker to IDLE here, or will intruduce race that cannot be detected
+	// DO NOT change worker state here, or will intruduce deadlock
+	// Must wait the RPC return to sync worker state
 
 	info("[%s]Done: %v", w.Sock, t)
 	args := TaskDoneArgs{w.ID, t.Type, t.ID, output}
@@ -134,10 +147,10 @@ func (w *WorkerInfo) Done(t *WorkerTask, output []string) {
 		w.Registry()
 		w.Done(t, output)
 	}
-	w.mu.Lock()
+	w.cond.L.Lock()
 	w.state = reply.SyncState
 	debug("[%s]Done: Sync state to %s", w.Sock, statename[w.state])
-	w.mu.Unlock()
+	w.cond.L.Unlock()
 }
 
 // main/mrworker.go calls this function.
@@ -146,6 +159,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your workera implementation here.
 	worker := WorkerInfo{}
+	worker.cond = sync.NewCond(&sync.Mutex{})
 	// Start RPC server and register to coordinator
 	worker.server()
 
@@ -261,11 +275,17 @@ LoopStart:
 			os.Rename(tmpname, oname)
 			worker.Done(t, []string{oname})
 		case EXIT:
-			info("[%s]Received EXIT", worker.Sock)
-			os.Remove(worker.Sock)
-			os.Exit(0)
+			worker.exit()
 		default:
-			time.Sleep(WAIT_DURATION)
+			worker.cond.L.Lock()
+			if worker.update {
+				worker.cond.L.Unlock()
+				continue
+			}
+			debug("[%s]Worker: waiting for task", worker.Sock)
+			worker.cond.Wait()
+			worker.cond.L.Unlock()
+			debug("[%s]Worker: wake", worker.Sock)
 		}
 	}
 }

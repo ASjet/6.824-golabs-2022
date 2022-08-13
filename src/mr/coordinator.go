@@ -23,10 +23,8 @@ const (
 	REDUCE
 	EXIT
 
-	DEBUG = false
-	INFO  = false
+	LOG_LEVEL = 2
 
-	WAIT_DURATION = time.Millisecond * 1000
 	PING_INTERVAL = time.Second
 )
 
@@ -46,13 +44,13 @@ var taskname = []string{
 }
 
 func debug(fmts string, args ...any) {
-	if DEBUG {
+	if LOG_LEVEL < 1 {
 		log.Printf(fmts, args...)
 	}
 }
 
 func info(fmts string, args ...any) {
-	if INFO || DEBUG {
+	if LOG_LEVEL < 2 {
 		fmt.Printf(fmts+"\n", args...)
 	}
 }
@@ -139,6 +137,9 @@ func (w *WorkerRecord) dial() error {
 
 // Make RPC call, must hold lock
 func (w *WorkerRecord) call(rpcName string, args, reply interface{}) bool {
+	if w.State == FAIL {
+		return false
+	}
 	err := w.Client.Call(rpcName, args, reply)
 	if w.State == EXIT {
 		return true
@@ -158,19 +159,20 @@ func (w *WorkerRecord) call(rpcName string, args, reply interface{}) bool {
 }
 
 // Ping worker to get health status
-func (w *WorkerRecord) Ping() {
+func (w *WorkerRecord) Ping() bool {
 	defer w.Mu.Unlock()
-	w.Mu.Lock()
 	args := PingArgs{}
 	reply := PingReply{}
 	// Need hold lock until RPC return
 	// Or a ping before this call return will clear the worker's state
+	w.Mu.Lock()
 	success := w.call("WorkerInfo.Ping", &args, &reply)
 
 	if success {
 		w.State = reply.State
 	}
 	debug("Ping: %s %s on %s", w.Sock, statename[w.State], w.task)
+	return w.State == IDLE
 }
 
 func (w *WorkerRecord) IsFault() bool {
@@ -231,9 +233,9 @@ func (i *Input) DoneBy(w *WorkerRecord) bool {
 	i.Mu.Lock()
 	// Discard repeated done
 	if i.State != COMPLETED {
-		i.State = COMPLETED
 		i.Worker = w
 		i.Dura = time.Since(i.Start)
+		i.State = COMPLETED
 		return true
 	}
 	return false
@@ -258,6 +260,8 @@ type Coordinator struct {
 	nReduce    int
 	reduceLeft atomic.Int32
 	reduces    []Input
+
+	workerCond *sync.Cond
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -269,11 +273,12 @@ func (c *Coordinator) RegistryWorker(args *RegistryArgs, reply *RegistryReply) e
 
 	// Init worker and dial up
 	w := WorkerRecord{Sock: args.Sock, State: IDLE, task: nil}
-	defer w.Mu.Unlock()
 	w.Mu.Lock()
 	if err := w.dial(); err != nil {
+		w.Mu.Unlock()
 		return err
 	}
+	w.Mu.Unlock()
 
 	// Assign Worker ID
 	c.workerMu.Lock()
@@ -283,6 +288,7 @@ func (c *Coordinator) RegistryWorker(args *RegistryArgs, reply *RegistryReply) e
 
 	reply.WorkerID, reply.Sockname = id, w.Sock
 	info("RegistryWorker: assign worker id %d to %s", id, w.Sock)
+	c.workerCond.Broadcast()
 	return nil
 }
 
@@ -299,11 +305,11 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 
 	w := c.workers[args.WorkerID]
 	w.Mu.Lock()
-	w.State = IDLE
 	i := w.input
 	t := w.task
 	w.input = nil
 	w.task = nil
+	w.State = IDLE
 	reply.SyncState = w.State
 	w.Mu.Unlock()
 
@@ -329,6 +335,7 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 		}
 		info("TaskDone: %s done in %s, %d task(s) left", t, i.Dura, left)
 	}
+	c.workerCond.Broadcast()
 	return nil
 }
 
@@ -349,7 +356,9 @@ func (c *Coordinator) GetWorker() *WorkerRecord {
 		c.workerMu.Unlock()
 		// Wait until worker avaliable
 		debug("GetWorker: Waiting for avaliable worker")
-		time.Sleep(WAIT_DURATION)
+		c.workerCond.L.Lock()
+		c.workerCond.Wait()
+		c.workerCond.L.Unlock()
 	}
 }
 
@@ -388,7 +397,9 @@ func (c *Coordinator) Schedule() {
 		}
 		// Wait until all map tasks done
 		debug("Schedule: Waiting for map tasks done")
-		time.Sleep(WAIT_DURATION)
+		c.workerCond.L.Lock()
+		c.workerCond.Wait()
+		c.workerCond.L.Unlock()
 	}
 	info("Schedule: Start schedule reduce tasks")
 	// Start to schedule reduce tasks
@@ -424,10 +435,12 @@ func (c *Coordinator) Schedule() {
 
 		// Wait until all reduce tasks done
 		debug("Schedule: Waiting for reduce tasks done")
-		time.Sleep(WAIT_DURATION)
+		c.workerCond.L.Lock()
+		c.workerCond.Wait()
+		c.workerCond.L.Unlock()
 	}
 
-	// Boardcast EXIT task
+	// Broadcast EXIT task
 	for _, w := range c.workers {
 		w.AssignNewTask(TASK_EXIT, nil)
 	}
@@ -445,7 +458,9 @@ func (c *Coordinator) pinger(pingDuration time.Duration) {
 				if w.IsFault() {
 					return
 				}
-				w.Ping()
+				if w.Ping() {
+					c.workerCond.Broadcast()
+				}
 			}(w)
 		}
 		c.workerMu.Unlock()
@@ -453,6 +468,12 @@ func (c *Coordinator) pinger(pingDuration time.Duration) {
 
 		// Wait for next check iteration
 		time.Sleep(pingDuration)
+
+		// Check if all task is done
+		ml, rl := c.mapLeft.Load(), c.reduceLeft.Load()
+		if (ml == 0) && (rl == 0) {
+			break
+		}
 	}
 }
 
@@ -493,6 +514,7 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
+	c.workerCond = sync.NewCond(&sync.Mutex{})
 
 	// Your code here.
 	c.nReduce = nReduce
