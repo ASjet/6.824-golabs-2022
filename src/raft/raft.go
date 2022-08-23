@@ -211,18 +211,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	debug("[%d]RequestVote: current state: %s, term: %d, votedFor: %d",
 		rf.me, rf.state, rf.currentTerm, rf.votedFor)
+
 	if rf.currentTerm > args.Term {
-		// Reject
-		info("[%d]RequestVote: RequestVote: reject: current term %d > request term %d",
-			rf.me, rf.currentTerm, args.Term)
+		// Reject: stale term
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		info("[%d]RequestVote: reject: stale term %d, current term %d",
+			rf.me, args.Term, rf.currentTerm)
 		return
 	}
 
 	if rf.currentTerm < args.Term {
-		debug("[%d]RequestVote: RequestVote: stale term: %d, got %d",
-			rf.me, rf.currentTerm, args.Term)
+		info("[%d]RequestVote: %s-%d ==> %s-%d",
+			rf.me, rf.state, rf.currentTerm, FOLLOWER, args.Term)
 		rf.state = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
@@ -233,20 +234,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// Candidate's log is at least as up-to-date as receiver's
 		if logAhead >= 0 {
 			// Grant
-			debug("[%d]RequestVote: candidate ahead %d log entries",
-				rf.me, logAhead)
-			info("[%d]RequestVote: grant: vote for candidate %d on term %d",
-				rf.me, args.CandidateId, args.Term)
+			// Reset timer
+			rf.timerFlag.Store(false)
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			rf.persist()
-			rf.timerFlag.Store(false)
+			debug("[%d]RequestVote: candidate ahead %d log entries",
+				rf.me, logAhead)
+			debug("[%d]RequestVote: grant: vote for candidate %d on term %d",
+				rf.me, args.CandidateId, args.Term)
 			reply.Term = args.Term
 			reply.VoteGranted = true
 			return
 		} else {
 			// Reject
-			info("[%d]RequestVote: reject: candidate behind %d log entries",
+			debug("[%d]RequestVote: reject: candidate behind %d log entries",
 				rf.me, logAhead)
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
@@ -254,7 +256,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 	// Reject
-	info("[%d]RequestVote: reject: already vote to candidate %d",
+	debug("[%d]RequestVote: reject: already vote to candidate %d",
 		rf.me, rf.votedFor)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -281,28 +283,41 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 // This is a RPC call
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	debug("[%d]AppendEntries: receive entries on term %d from leader %d",
-		rf.me, args.Term, args.LeaderId)
 	defer rf.mu.Unlock()
 	rf.mu.Lock()
 	if rf.currentTerm > args.Term {
+		// Stale leader term
+		debug("[%d]AppendEntries: stale leader %d on term %d, current leader %d on term %d",
+			rf.me, args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
+	} else {
+		// New leader
+		if rf.votedFor != args.LeaderId {
+			info("[%d]AppendEntries: new leader %d on term %d",
+				rf.me, args.LeaderId, args.Term)
+		}
+		rf.currentTerm = args.Term
+		rf.votedFor = args.LeaderId
+		rf.state = FOLLOWER
 	}
 
 	if rf.currentTerm == args.PreLogTerm {
 		if len(rf.log)+1 < args.PrevLogIndex {
+			// Stale leader entries
 			reply.Term = rf.currentTerm
 			reply.Success = false
 			return
 		}
+		// Update entries
 	}
 
 	// Heartbeat
 	if len(args.Entries) == 0 {
-		debug("[%d]AppendEntries: heartbeat message from leader %d",
-			rf.me, args.LeaderId)
+		debug("[%d]AppendEntries: heartbeat message from leader %d on term %d",
+			rf.me, args.LeaderId, args.Term)
+		// Reset timer
 		rf.timerFlag.Store(false)
 	}
 }
@@ -335,9 +350,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 
+// Must call with holding lock
 func (rf *Raft) claimLeadership() {
-	rf.mu.Lock()
-	rf.state = LEADER
 	rf.persist()
 	args := AppendEntriesArgs{
 		Term:     rf.currentTerm,
@@ -371,6 +385,7 @@ func (rf *Raft) claimLeadership() {
 		wg.Wait()
 		time.Sleep(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL))
 	}
+	rf.mu.Lock()
 }
 
 type Vote struct {
@@ -435,13 +450,15 @@ func (rf *Raft) newElection() {
 			resp++
 			votes += v.Vote
 			if v.Vote == 1 {
-				info("[%d]newElection: got vote from server %d, now %d/%d/%d vote(s) on term %d",
+				debug("[%d]newElection: got vote from server %d, now %d/%d/%d vote(s) on term %d",
 					rf.me, v.Server, votes, resp, all, args.Term)
 			} else {
-				info("[%d]newElection: got reject from server %d, now %d/%d/%d vote(s) on term %d",
+				debug("[%d]newElection: got reject from server %d, now %d/%d/%d vote(s) on term %d",
 					rf.me, v.Server, votes, resp, all, args.Term)
 			}
 			if votes > half {
+				// Win immidiately if the candidate got majority votes
+				rf.timerFlag.Store(false)
 				break
 			}
 		} else {
@@ -449,28 +466,30 @@ func (rf *Raft) newElection() {
 				term, _ := rf.GetState()
 				info("[%d]newElection: stale term %d, latest %d, convert to follower",
 					rf.me, args.Term, term)
-				break
+				return
 			} else {
-				info("[%d]newElection: no reply from server %d", rf.me, v.Server)
+				debug("[%d]newElection: no reply from server %d on term %d",
+					rf.me, v.Server, args.Term)
 			}
 		}
 	}
 	rf.mu.Lock()
 	debug("[%d]newElection: state after election on term %d: %s",
 		rf.me, args.Term, rf.state)
-	rf.mu.Unlock()
-	term, _ := rf.GetState()
-	if term == args.Term {
+	if rf.currentTerm == args.Term {
 		if votes > half {
-			info("[%d]newElection: won the election! got %d/%d/%d votes",
-				rf.me, votes, resp, all)
-			rf.timerFlag.Store(false)
+			// Win the election
+			rf.state = LEADER
+			info("[%d]newElection: won the election on term %d! got %d/%d/%d votes",
+				rf.me, args.Term, votes, resp, all)
 			rf.claimLeadership()
 		} else {
-			info("[%d]newElection: lost the election, got %d/%d/%d votes",
-				rf.me, votes, resp, all)
+			// Lose the election or no winner
+			info("[%d]newElection: lost the election on term %d, got %d/%d/%d votes",
+				rf.me, args.Term, votes, resp, all)
 		}
 	}
+	rf.mu.Unlock()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -521,16 +540,26 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rf.mu.Lock()
-		term := rf.currentTerm
-		voted := rf.votedFor
-		rf.mu.Unlock()
-		dura := ELECTION_TIMEOUT_DURATION + rand.Int31n(ELECTION_TIMEOUT_DURATION)
-		rf.timerFlag.Store(true)
 		rand.Seed(makeSeed())
-		debug("[%d]ticker: new election timeout: %d ms on term %d", rf.me, dura, term)
+		dura := ELECTION_TIMEOUT_DURATION + rand.Int31n(ELECTION_TIMEOUT_DURATION)
+		term, isleader := rf.GetState()
+		debug("[%d]ticker: new timer: %d ms on term %d", rf.me, dura, term)
+		rf.timerFlag.Store(true)
 		time.Sleep(time.Millisecond * time.Duration(dura))
+		if isleader {
+			continue
+		}
+		if rf.killed() {
+			break
+		}
 		if rf.timerFlag.Load() {
+			debug("[%d]ticker: timer fired on term %d", rf.me, term)
+			rf.mu.Lock()
+			voted := rf.votedFor
+			if rf.currentTerm != term {
+				rf.mu.Unlock()
+				continue
+			}
 			switch voted {
 			case NIL_LEADER:
 				info("[%d]ticker: init election timeout", rf.me)
@@ -539,7 +568,8 @@ func (rf *Raft) ticker() {
 			default:
 				info("[%d]ticker: lost communication with leader %d", rf.me, voted)
 			}
-			rf.newElection()
+			rf.mu.Unlock()
+			go rf.newElection()
 		}
 	}
 }
