@@ -20,7 +20,11 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
+	"log"
 	"math/rand"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,7 +74,7 @@ func (s State) String() string {
 	case LEADER:
 		return "LEADER"
 	}
-	return ""
+	return "SERVER"
 }
 
 type CommandType string
@@ -112,6 +116,30 @@ type Raft struct {
 	/* -----State----- */
 
 	timerFlag atomic.Bool
+}
+
+func (rf *Raft) makeLog(logger *log.Logger, fmts string, args ...any) {
+	if DEBUG {
+		pc, _, _, ok := runtime.Caller(2)
+		details := runtime.FuncForPC(pc)
+		funcName := ""
+		if ok && details != nil {
+			tmp := strings.Split(details.Name(), ".")
+			funcName = tmp[len(tmp)-1]
+		}
+		prefix := fmt.Sprintf("[%d]%s: ", rf.me, funcName)
+		logger.Printf(prefix+fmts, args...)
+	}
+}
+
+func (rf *Raft) debug(fmts string, args ...any) {
+	rf.makeLog(debugLogger, fmts, args...)
+}
+func (rf *Raft) info(fmts string, args ...any) {
+	rf.makeLog(infoLogger, fmts, args...)
+}
+func (rf *Raft) warn(fmts string, args ...any) {
+	rf.makeLog(warningLogger, fmts, args...)
 }
 
 // return currentTerm and whether this server
@@ -205,25 +233,27 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // This is a RPC call
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	debug("[%d]RequestVote: receive vote request on term %d from candidate %d",
-		rf.me, args.Term, args.CandidateId)
+	rf.debug("receive vote request on term %d from candidate %d",
+		args.Term, args.CandidateId)
 	defer rf.mu.Unlock()
 	rf.mu.Lock()
-	debug("[%d]RequestVote: current state: %s, term: %d, votedFor: %d",
-		rf.me, rf.state, rf.currentTerm, rf.votedFor)
+	// Set current term
+	reply.Term = rf.currentTerm
+	rf.debug("current state: %s, term: %d, votedFor: %d",
+		rf.state, rf.currentTerm, rf.votedFor)
 
 	if rf.currentTerm > args.Term {
 		// Reject: stale term
 		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		info("[%d]RequestVote: reject: stale term %d, current term %d",
-			rf.me, args.Term, rf.currentTerm)
+		rf.info("reject: stale term %d, current term %d",
+			args.Term, rf.currentTerm)
 		return
 	}
 
 	if rf.currentTerm < args.Term {
-		info("[%d]RequestVote: %s-%d ==> %s-%d",
-			rf.me, rf.state, rf.currentTerm, FOLLOWER, args.Term)
+		// info("[%d]RequestVote: %s-%d ==> %s-%d",
+		// 	rf.me, rf.state, rf.currentTerm, FOLLOWER, args.Term)
+		rf.info("%s-%d ==> %s-%d", rf.state, rf.currentTerm, FOLLOWER, args.Term)
 		rf.state = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
@@ -239,25 +269,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			rf.persist()
-			debug("[%d]RequestVote: candidate ahead %d log entries",
-				rf.me, logAhead)
-			debug("[%d]RequestVote: grant: vote for candidate %d on term %d",
-				rf.me, args.CandidateId, args.Term)
+			rf.debug("candidate ahead %d log entries", logAhead)
+			rf.debug("grant: vote for candidate %d on term %d",
+				args.CandidateId, args.Term)
 			reply.Term = args.Term
 			reply.VoteGranted = true
 			return
 		} else {
 			// Reject
-			debug("[%d]RequestVote: reject: candidate behind %d log entries",
-				rf.me, logAhead)
+			rf.debug("reject: candidate behind %d log entries", logAhead)
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
 			return
 		}
 	}
 	// Reject
-	debug("[%d]RequestVote: reject: already vote to candidate %d",
-		rf.me, rf.votedFor)
+	rf.debug("reject: already vote to candidate %d", rf.votedFor)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 }
@@ -287,16 +314,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	if rf.currentTerm > args.Term {
 		// Stale leader term
-		debug("[%d]AppendEntries: stale leader %d on term %d, current leader %d on term %d",
-			rf.me, args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
+		rf.debug("stale leader %d on term %d, current leader %d on term %d",
+			args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	} else {
 		// New leader
 		if rf.votedFor != args.LeaderId {
-			info("[%d]AppendEntries: new leader %d on term %d",
-				rf.me, args.LeaderId, args.Term)
+			rf.info("new leader %d on term %d", args.LeaderId, args.Term)
 		}
 		rf.currentTerm = args.Term
 		rf.votedFor = args.LeaderId
@@ -315,8 +341,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Heartbeat
 	if len(args.Entries) == 0 {
-		debug("[%d]AppendEntries: heartbeat message from leader %d on term %d",
-			rf.me, args.LeaderId, args.Term)
+		rf.debug("heartbeat message from leader %d on term %d",
+			args.LeaderId, args.Term)
 		// Reset timer
 		rf.timerFlag.Store(false)
 	}
@@ -358,7 +384,7 @@ func (rf *Raft) claimLeadership() {
 		LeaderId: rf.me,
 		Entries:  []LogEntry{},
 	}
-	debug("[%d]claimLeadership: state: %s, term: %d", rf.me, rf.state, rf.currentTerm)
+	rf.debug("state: %s, term: %d", rf.state, rf.currentTerm)
 	rf.mu.Unlock()
 
 	for !rf.killed() {
@@ -366,23 +392,19 @@ func (rf *Raft) claimLeadership() {
 		if !isleader {
 			break
 		}
-		wg := sync.WaitGroup{}
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
 			}
-			wg.Add(1)
 			go func(index int) {
-				debug("[%d]claimLeadership: send heartbeat to server %d", rf.me, index)
+				rf.debug("send heartbeat to server %d", index)
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(index, &args, &reply)
 				if !ok {
 					// do something
 				}
-				wg.Done()
 			}(i)
 		}
-		wg.Wait()
 		time.Sleep(time.Millisecond * time.Duration(HEARTBEAT_INTERVAL))
 	}
 	rf.mu.Lock()
@@ -404,7 +426,7 @@ func (rf *Raft) newElection() {
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	info("[%d]newElection: start new election on term %d", rf.me, rf.currentTerm)
+	rf.info("start new election on term %d", rf.currentTerm)
 	rf.mu.Unlock()
 
 	ch := make(chan Vote)
@@ -417,8 +439,7 @@ func (rf *Raft) newElection() {
 			continue
 		}
 		go func(index int) {
-			debug("[%d]newElection: request vote from server %d on term %d",
-				rf.me, index, args.Term)
+			rf.debug("request vote from server %d on term %d", index, args.Term)
 			reply := RequestVoteReply{}
 			ok := rf.sendRequestVote(index, &args, &reply)
 			if ok {
@@ -450,11 +471,11 @@ func (rf *Raft) newElection() {
 			resp++
 			votes += v.Vote
 			if v.Vote == 1 {
-				debug("[%d]newElection: got vote from server %d, now %d/%d/%d vote(s) on term %d",
-					rf.me, v.Server, votes, resp, all, args.Term)
+				rf.debug("got vote from server %d, now %d/%d/%d vote(s) on term %d",
+					v.Server, votes, resp, all, args.Term)
 			} else {
-				debug("[%d]newElection: got reject from server %d, now %d/%d/%d vote(s) on term %d",
-					rf.me, v.Server, votes, resp, all, args.Term)
+				rf.debug("got reject from server %d, now %d/%d/%d vote(s) on term %d",
+					v.Server, votes, resp, all, args.Term)
 			}
 			if votes > half {
 				// Win immidiately if the candidate got majority votes
@@ -464,29 +485,27 @@ func (rf *Raft) newElection() {
 		} else {
 			if v.Vote == -1 {
 				term, _ := rf.GetState()
-				info("[%d]newElection: stale term %d, latest %d, convert to follower",
-					rf.me, args.Term, term)
+				rf.info("stale term %d, latest %d, convert to follower",
+					args.Term, term)
 				return
 			} else {
-				debug("[%d]newElection: no reply from server %d on term %d",
-					rf.me, v.Server, args.Term)
+				rf.debug("no reply from server %d on term %d", v.Server, args.Term)
 			}
 		}
 	}
 	rf.mu.Lock()
-	debug("[%d]newElection: state after election on term %d: %s",
-		rf.me, args.Term, rf.state)
+	rf.debug("state after election on term %d: %s", args.Term, rf.state)
 	if rf.currentTerm == args.Term {
 		if votes > half {
 			// Win the election
 			rf.state = LEADER
-			info("[%d]newElection: won the election on term %d! got %d/%d/%d votes",
-				rf.me, args.Term, votes, resp, all)
+			rf.info("won the election on term %d! got %d/%d/%d votes",
+				args.Term, votes, resp, all)
 			rf.claimLeadership()
 		} else {
 			// Lose the election or no winner
-			info("[%d]newElection: lost the election on term %d, got %d/%d/%d votes",
-				rf.me, args.Term, votes, resp, all)
+			rf.info("lost the election on term %d, got %d/%d/%d votes",
+				args.Term, votes, resp, all)
 		}
 	}
 	rf.mu.Unlock()
@@ -543,7 +562,9 @@ func (rf *Raft) ticker() {
 		rand.Seed(makeSeed())
 		dura := ELECTION_TIMEOUT_DURATION + rand.Int31n(ELECTION_TIMEOUT_DURATION)
 		term, isleader := rf.GetState()
-		debug("[%d]ticker: new timer: %d ms on term %d", rf.me, dura, term)
+		rf.mu.Lock()
+		rf.debug("new timer: %d ms on term %d", dura, term)
+		rf.mu.Unlock()
 		rf.timerFlag.Store(true)
 		time.Sleep(time.Millisecond * time.Duration(dura))
 		if isleader {
@@ -553,8 +574,8 @@ func (rf *Raft) ticker() {
 			break
 		}
 		if rf.timerFlag.Load() {
-			debug("[%d]ticker: timer fired on term %d", rf.me, term)
 			rf.mu.Lock()
+			rf.debug("timer fired on term %d", term)
 			voted := rf.votedFor
 			if rf.currentTerm != term {
 				rf.mu.Unlock()
@@ -562,11 +583,11 @@ func (rf *Raft) ticker() {
 			}
 			switch voted {
 			case NIL_LEADER:
-				info("[%d]ticker: init election timeout", rf.me)
+				rf.info("init election timeout")
 			case rf.me:
-				info("[%d]ticker: election on term %d timeout", rf.me, term)
+				rf.info("election on term %d timeout", term)
 			default:
-				info("[%d]ticker: lost communication with leader %d", rf.me, voted)
+				rf.info("lost communication with leader %d", voted)
 			}
 			rf.mu.Unlock()
 			go rf.newElection()
