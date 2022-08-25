@@ -77,10 +77,10 @@ func (s State) String() string {
 	return "SERVER"
 }
 
-type CommandType string
+type CommandType interface{}
 type LogEntry struct {
 	Term    int
-	Command string
+	Command CommandType
 }
 
 // A Go object implementing a single Raft peer.
@@ -201,7 +201,8 @@ func (rf *Raft) readPersist(data []byte) {
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
+	snapshot []byte) bool {
 
 	// Your code here (2D).
 
@@ -309,7 +310,8 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs,
+	reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -329,17 +331,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
 		reply.Success = false
 		return
-	} else {
-		if rf.votedFor != args.LeaderId {
-			// New leader
-			rf.info("new leader %d at term %d", args.LeaderId, args.Term)
-		}
-		rf.follow(args.LeaderId, args.Term)
-		rf.persist()
 	}
 
+	// Reset timer
+	rf.timerFire.Store(false)
+
+	if rf.votedFor != args.LeaderId {
+		// New leader
+		rf.info("new leader %d at term %d", args.LeaderId, args.Term)
+	}
+	rf.follow(args.LeaderId, args.Term)
+	rf.persist()
+
 	if rf.currentTerm == args.PreLogTerm {
-		if len(rf.log)+1 < args.PrevLogIndex {
+		if len(rf.log) >= args.PrevLogIndex {
 			// Stale leader entries
 			return
 		}
@@ -350,8 +355,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		rf.debug("heartbeat message from leader %d at term %d",
 			args.LeaderId, args.Term)
-		// Reset timer
-		rf.timerFire.Store(false)
 	}
 }
 
@@ -516,6 +519,7 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 	rf.mu.Lock()
 	rf.debug("state after election at term %d: %s", term, rf.state)
 	if rf.currentTerm == term {
+		// Still at the same term
 		if votes > half {
 			// Win the election
 			rf.state = LEADER
@@ -638,7 +642,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = NIL_LEADER
-	rf.log = []LogEntry{{0, ""}}
+	rf.log = []LogEntry{{0, nil}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
