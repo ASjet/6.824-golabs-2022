@@ -87,7 +87,7 @@ func (rf *Raft) agreement(term int) {
 		if i == rf.me {
 			continue
 		}
-		rf.nextIndex[i] = next - 1
+		rf.nextIndex[i] = next
 		rf.matchIndex[i] = 0
 		go rf.agreementWith(term, i, ch)
 	}
@@ -97,6 +97,9 @@ func (rf *Raft) agreement(term int) {
 	last := len(rf.log) - 1
 	rf.debug("%s", logStr(rf.log, 0))
 	rf.newCmd.L.Unlock()
+	if last == 0 {
+		last = 1
+	}
 
 	// count replicas
 	cnt := 0
@@ -110,8 +113,9 @@ func (rf *Raft) agreement(term int) {
 		if cnt > half {
 			// advance commit
 			rf.applyCmd.L.Lock()
-			rf.info("commit log%s", logStr(rf.log[rf.commitIndex:last+1], rf.commitIndex))
+			oldcommit := rf.commitIndex + 1
 			rf.commitIndex = last
+			rf.info("commit log[%d:%d]", oldcommit, last+1)
 			rf.applyCmd.L.Unlock()
 
 			go rf.applyLog()
@@ -154,8 +158,8 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 		}
 		rf.applyCmd.L.Unlock()
 
-		rf.debug("send log%s to follower %d, prev %d@%d",
-			logStr(args.Entries, next), index,
+		rf.debug("send log[%d:%d]%s to follower %d, prev %d@%d",
+			next, last, logStr(args.Entries, next), index,
 			args.PrevLogIndex, args.PrevLogTerm)
 
 		reply := AppendEntriesReply{}
