@@ -52,20 +52,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type State int
-
-func (s State) String() string {
-	switch s {
-	case FOLLOWER:
-		return "FOLLOWER"
-	case CANDIDATE:
-		return "CANDIDATE"
-	case LEADER:
-		return "LEADER"
-	}
-	return "SERVER"
-}
-
 type LogEntry struct {
 	Term    int
 	Command interface{}
@@ -78,50 +64,45 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      atomic.Bool         // set by Kill()
+	apply     chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	timerFire atomic.Bool
+	newCmd    *sync.Cond
+	applyCmd  *sync.Cond
+
 	/* +++++State+++++ */
 
 	// Persistent state on all servers
 	// Update to stable storage before responding to RPCs
+	// hold mu
 	isLeader    atomic.Bool
 	state       State
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+
+	// hold newCmd lock
+	log []LogEntry
 
 	// Volatile state on all servers
+	// hold applyCmd lock
 	commitIndex int
 	lastApplied int
 
 	// Volatile state on leaders
 	// Reinitialize after election
+	// no lock
 	nextIndex  []int
 	matchIndex []int
 
 	/* -----State----- */
 
-	timerFire atomic.Bool
-	c         *sync.Cond
 }
 
-// call with holding lock
-func (rf *Raft) follow(leader, term int) {
-	rf.currentTerm = term
-	rf.votedFor = leader
-	if leader == rf.me {
-		rf.state = CANDIDATE
-	} else {
-		rf.state = FOLLOWER
-	}
-	rf.isLeader.Store(false)
-	rf.c.Broadcast()
-}
-
-func (rf *Raft) makeLog(logger *log.Logger, fmts string, args ...any) {
+func (rf *Raft) dprintf(logger *log.Logger, fmts string, args ...any) {
 	if DEBUG {
 		pc, _, _, ok := runtime.Caller(2)
 		details := runtime.FuncForPC(pc)
@@ -136,13 +117,13 @@ func (rf *Raft) makeLog(logger *log.Logger, fmts string, args ...any) {
 }
 
 func (rf *Raft) debug(fmts string, args ...any) {
-	rf.makeLog(debugLogger, fmts, args...)
+	rf.dprintf(debugLogger, fmts, args...)
 }
 func (rf *Raft) info(fmts string, args ...any) {
-	rf.makeLog(infoLogger, fmts, args...)
+	rf.dprintf(infoLogger, fmts, args...)
 }
 func (rf *Raft) warn(fmts string, args ...any) {
-	rf.makeLog(warningLogger, fmts, args...)
+	rf.dprintf(warningLogger, fmts, args...)
 }
 
 // return currentTerm and whether this server
@@ -152,8 +133,9 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	term := rf.currentTerm
+	isLeader := rf.isLeader.Load()
 	rf.mu.Unlock()
-	return term, rf.isLeader.Load()
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -245,10 +227,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
-	rf.mu.Lock()
-	rf.log = append(rf.log, LogEntry{term, command})
-	rf.mu.Unlock()
-	rf.c.Broadcast()
+	if isLeader {
+		rf.newCmd.L.Lock()
+		next := len(rf.log)
+		rf.debug("new command %v at log entry %d@%d", command, next, term)
+		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		rf.debug("%s", logStr(rf.log, 0))
+		rf.newCmd.L.Unlock()
+		rf.newCmd.Broadcast()
+		index = next
+		// rf.applyCmd.L.Lock()
+		// index = rf.commitIndex
+		// rf.applyCmd.L.Unlock()
+		// return until commited
+		// for rf.isLeader.Load() && !rf.killed() {
+		// 	rf.applyCmd.L.Lock()
+		// 	if rf.lastApplied > next {
+		// 		rf.applyCmd.L.Unlock()
+		// 		rf.debug("command %d@%d applied, return to client", next, term)
+		// 		break
+		// 	}
+		// 	rf.debug("wait for command %d@%d apply...", next, term)
+		// 	rf.applyCmd.Wait()
+		// 	rf.applyCmd.L.Unlock()
+		// }
+	}
 	return index, term, isLeader
 }
 
@@ -286,7 +289,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.c = sync.NewCond(&sync.Mutex{})
+	rf.newCmd = sync.NewCond(&sync.Mutex{})
+	rf.applyCmd = sync.NewCond(&sync.Mutex{})
+	rf.apply = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.dead.Store(false)
