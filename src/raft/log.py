@@ -45,6 +45,7 @@ def print_table(file: str, title: str, lines: int = -1) -> None:
             if lines > 0 and line_cnt > lines:
                 break
             line_cnt += 1
+        table.add_row(*last_row)
 
     console = Console()
     console.print(table)
