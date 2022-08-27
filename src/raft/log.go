@@ -69,6 +69,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs,
 
 func (rf *Raft) agreement(term int) {
 	// init
+	rf.info("init leader states")
 	allPeers := len(rf.peers)
 	rf.nextIndex = make([]int, allPeers)
 	rf.matchIndex = make([]int, allPeers)
@@ -77,9 +78,16 @@ func (rf *Raft) agreement(term int) {
 	rf.lastApplied = 0
 	rf.applyCmd.L.Unlock()
 	rf.newCmd.L.Lock()
-	next := len(rf.log)
+	next := len(rf.log) - 1
+	if next == 0 {
+		// If there is no log, wait for new command
+		rf.debug("log is empty, wait for new command")
+		rf.newCmd.Wait()
+	}
+	next = len(rf.log) - 1
+	rf.info("Start establish agreement at")
+	rf.debug("%s", logStr(rf.log, 0))
 	rf.newCmd.L.Unlock()
-	rf.info("init leader states")
 
 	ch := make(chan ReplicaLog)
 
@@ -93,36 +101,35 @@ func (rf *Raft) agreement(term int) {
 	}
 
 	half := allPeers / 2
-	rf.newCmd.L.Lock()
-	last := len(rf.log) - 1
-	rf.debug("%s", logStr(rf.log, 0))
-	rf.newCmd.L.Unlock()
-	if last == 0 {
-		last = 1
-	}
+	last := next
 
 	// count replicas
-	cnt := 0
+	cnt := 1
 	for rl := range ch {
 		rf.matchIndex[rl.Server] = rl.Index
-		rf.debug("match server %d at log %d@%d",
-			rl.Server, rl.Index, rf.log[rl.Index].Term)
+		rf.debug("match server %d at log %d@%d, current N = %d",
+			rl.Server, rl.Index, rf.log[rl.Index].Term, last)
 		if rl.Index >= last {
 			cnt++
 		}
 		if cnt > half {
 			// advance commit
 			rf.applyCmd.L.Lock()
-			oldcommit := rf.commitIndex + 1
+			commitStart := rf.commitIndex + 1
 			rf.commitIndex = last
-			rf.info("commit log[%d:%d]", oldcommit, last+1)
+			rf.info("commit log[%d:%d]", commitStart, last+1)
 			rf.applyCmd.L.Unlock()
 
 			go rf.applyLog()
 
 			rf.newCmd.L.Lock()
+			if last == len(rf.log)-1 {
+				rf.debug("no log need to be commit, wait for new command")
+				rf.newCmd.Wait()
+			}
 			last = len(rf.log) - 1
 			rf.newCmd.L.Unlock()
+			cnt = 1
 		}
 	}
 }
@@ -131,13 +138,14 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 	rf.info("establish agreement with follower %d at term %d", index, term)
 	for rf.isLeader.Load() && !rf.killed() {
 		rf.newCmd.L.Lock()
-		last := len(rf.log)
+		last := len(rf.log) - 1
 		next := rf.nextIndex[index]
 		prev := next - 1
 
-		if next > 0 && last-next == 0 {
+		if next > 0 && last-next < 0 {
 			// Wait for new command arrive
-			rf.debug("wait for new command...")
+			rf.debug("nextIndex: %d, lastLog: %d@%d, wait for new command...",
+				next, last, rf.log[last].Term)
 			rf.newCmd.Wait()
 			rf.newCmd.L.Unlock()
 			continue
@@ -153,14 +161,15 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			LeaderId:     rf.me,
 			PrevLogIndex: prev,
 			PrevLogTerm:  rf.log[prev].Term,
-			Entries:      rf.log[next:last],
+			Entries:      rf.log[next : last+1],
 			LeaderCommit: rf.commitIndex,
 		}
 		rf.applyCmd.L.Unlock()
 
-		rf.debug("send log[%d:%d]%s to follower %d, prev %d@%d",
-			next, last, logStr(args.Entries, next), index,
-			args.PrevLogIndex, args.PrevLogTerm)
+		rf.debug("send log[%d:%d] to follower %d, prev %d@%d, commit %d",
+			next, last+1, index, args.PrevLogIndex,
+			args.PrevLogTerm, args.LeaderCommit)
+		rf.debug("sent%s", logStr(args.Entries, next))
 
 		reply := AppendEntriesReply{}
 		if !rf.sendAppendEntries(index, &args, &reply) {
@@ -196,11 +205,11 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 		}
 
 		rf.info("update nextIndex[%d] from %d to %d at term %d",
-			index, next, last, term)
+			index, next, last+1, term)
 		// Update follower records
-		rf.nextIndex[index] = last
+		rf.nextIndex[index] = last + 1
 		if rf.isLeader.Load() {
-			ch <- ReplicaLog{last - 1, index}
+			ch <- ReplicaLog{last, index}
 		}
 	}
 }
@@ -236,9 +245,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 
+	if len(args.Entries) == 0 {
+		// Heartbeat
+		rf.debug("heartbeat from leader %d at term %d",
+			args.LeaderId, args.Term)
+	} else {
+		rf.debug("new entries from leader %d at term %d",
+			args.LeaderId, args.Term)
+		rf.debug("got%s", logStr(args.Entries, args.PrevLogIndex+1))
+
+		rf.debug("PrevLog: %d@%d, lastLog: %d@%d",
+			args.PrevLogIndex, args.PrevLogTerm, lastIndex, lastTerm)
+		rf.debug("%s", logStr(rf.log, 0))
+
+		if lastIndex < args.PrevLogIndex {
+			// Out-of-date entries, request for prev entry
+			rf.info("doesn't contain log entry at index %d, expect %d",
+				args.PrevLogIndex, lastIndex)
+			return
+		}
+
+		prevIndex := args.PrevLogIndex
+		prevTerm := rf.log[prevIndex].Term
+
+		if prevTerm != args.PrevLogTerm {
+			// Conflict term, delete followed entries, request for prev entry
+			rf.log = rf.log[:prevIndex]
+			rf.info("conflict: local entry %d@%d, got %d@%d",
+				prevIndex, prevTerm, args.PrevLogIndex, args.PrevLogTerm)
+			rf.persist()
+			return
+		}
+
+		// Append new entries from index args.PrevLogIndex+1
+		rf.log = append(rf.log[:prevIndex+1], args.Entries...)
+		last := len(rf.log) - 1
+		rf.debug("append log entries at [%d:%d] from leader %d at term %d",
+			prevIndex+1, last+1, args.LeaderId, args.Term)
+		rf.debug("%s", logStr(rf.log, 0))
+	}
+
 	// Update commit index
 	oldcommit := rf.commitIndex
-	if args.LeaderCommit > oldcommit {
+	if oldcommit != lastIndex && args.LeaderCommit > oldcommit {
 		if args.LeaderCommit > lastIndex {
 			rf.commitIndex = lastIndex
 		} else {
@@ -249,47 +298,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex, rf.log[rf.commitIndex].Term)
 		go rf.applyLog()
 	}
-
-	if len(args.Entries) == 0 {
-		// Heartbeat
-		rf.debug("heartbeat from leader %d at term %d",
-			args.LeaderId, args.Term)
-		reply.Success = true
-		return
-	}
-
-	rf.debug("new entries%s from leader %d at term %d",
-		logStr(args.Entries, args.PrevLogIndex+1), args.LeaderId, args.Term)
-
-	rf.debug("PrevLog: %d@%d, lastLog: %d@%d",
-		args.PrevLogIndex, args.PrevLogTerm, lastIndex, lastTerm)
-	rf.debug("%s", logStr(rf.log, 0))
-
-	if lastIndex < args.PrevLogIndex {
-		// Out-of-date entries, request for prev entry
-		rf.info("doesn't contain log entry at index %d, expect %d",
-			args.PrevLogIndex, lastIndex)
-		return
-	}
-
-	lastIndex = args.PrevLogIndex
-	lastTerm = rf.log[lastIndex].Term
-
-	if lastTerm != args.PrevLogTerm {
-		// Conflict term, delete followed entries, request for prev entry
-		rf.log = rf.log[:lastIndex]
-		rf.info("conflict: local entry %d@%d, got %d@%d",
-			lastIndex, lastTerm, args.PrevLogIndex, args.PrevLogTerm)
-		rf.persist()
-		return
-	}
-
-	// Append new entries from index args.PrevLogIndex+1
-	rf.log = append(rf.log[:lastIndex+1], args.Entries...)
-	last := len(rf.log) - 1
-	rf.debug("append log entries at [%d:%d] from leader %d at term %d",
-		lastIndex+1, last+1, args.LeaderId, args.Term)
-	rf.debug("%s", logStr(rf.log, 0))
 
 	reply.Success = true
 	rf.persist()
