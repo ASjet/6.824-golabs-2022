@@ -3,7 +3,7 @@ from rich.console import Console
 from rich.table import Table
 
 
-def parse(columns: int, line: str) -> list[str]:
+def parse(columns: int, line: str) -> tuple[list[str], bool]:
     row = [None] * (1 + columns)
     row[0] = line[16:21]
     num = int(line[23:24])
@@ -11,7 +11,7 @@ def parse(columns: int, line: str) -> list[str]:
     if num >= columns:
         content = f"[{num}]{content}"
     row[num % columns + 1] = content
-    return row
+    return row, "won" in content
 
 
 def print_table(file: str, title: str, columns: int = 3, lines: int = -1) -> None:
@@ -30,15 +30,15 @@ def print_table(file: str, title: str, columns: int = 3, lines: int = -1) -> Non
                 break
             if first:
                 try:
-                    last_row = parse(columns, line)
+                    last_row, won = parse(columns, line)
                     first = False
                 except:
                     if line[22:26] == "Make":
                         continue
             else:
                 try:
-                    row = parse(columns, line)
-                    table.add_row(*last_row, end_section=end_section)
+                    row, won = parse(columns, line)
+                    table.add_row(*last_row, end_section=end_section or won)
                     last_row = row
                     end_section = False
                 except:
