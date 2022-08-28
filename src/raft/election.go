@@ -10,9 +10,10 @@ const (
 	LEADER State = State(iota)
 	FOLLOWER
 	CANDIDATE
-	NIL_LEADER                = -1
-	ELECTION_TIMEOUT_DURATION = 250 // ms
-	HEARTBEAT_INTERVAL        = 150 //ms
+	NIL_LEADER               = -1
+	ELECTION_TIMEOUT_MINIMUM = 300 // ms
+	ELECTION_TIMEOUT_SPAN    = 500 // ms
+	HEARTBEAT_INTERVAL       = 150 //ms
 )
 
 type State int
@@ -66,11 +67,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
+	//  1. Reply false if term < currentTerm
 	if rf.currentTerm > args.Term {
-		// Reject: stale term
 		reply.VoteGranted = false
 		rf.info("reject: expect election term at least %d, got %d",
 			rf.currentTerm, args.Term)
+		return
+	}
+
+	if rf.currentTerm == args.Term && rf.votedFor != NIL_LEADER &&
+		rf.votedFor != args.CandidateId {
+		rf.info("reject: already voted candidate %d", rf.votedFor)
 		return
 	}
 
@@ -83,43 +90,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.debug("%s", logStr(rf.log, 0))
 
 	// Election restriction:
-	// 	Candidate's log is at least as up-to-date as receiver's
+	// Candidate's log is at least as up-to-date as receiver's
 	// More up-to-date definitions:
 	// 1. last log entry's term is equal or higher
-	// 2. length of log entries is equal or longer when term match
 	if lastTerm > args.LastLogTerm {
-		reply.VoteGranted = false
 		rf.info("reject: expect lastLogTerm at least %d, got %d",
 			lastTerm, args.LastLogTerm)
+		// update term to avoid keeping conflict in following election
+		// NOT SURE if it is necessary
+		// rf.currentTerm = args.Term
 		return
 	}
+	// 2. length of log entries is equal or longer when last term equal
 	if lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex {
-		reply.VoteGranted = false
 		rf.info("reject: expect lastLogIndex at least %d, got %d",
 			lastIndex, args.LastLogIndex)
+		// update term
+		// NOT SURE if it is necessary
+		// rf.currentTerm = args.Term
 		return
 	}
 
-	if rf.currentTerm < args.Term {
-		// update current term and follow
-		rf.debug("%s at term %d ==> %s at term %d",
-			rf.state, rf.currentTerm, FOLLOWER, args.Term)
-		rf.follow(NIL_LEADER, args.Term)
-	}
-
-	if rf.votedFor == NIL_LEADER || rf.votedFor == args.CandidateId {
-		// Grant thus the candidate's log is at least more up-to-date
-		// Reset timer
-		rf.timerFire.Store(false)
-		rf.follow(args.CandidateId, args.Term)
-		rf.persist()
-		reply.VoteGranted = true
-		rf.info("grant: vote candidate %d at term %d",
-			args.CandidateId, args.Term)
-	} else {
-		// Reject
-		rf.info("reject: already voted candidate %d", rf.votedFor)
-	}
+	//  2. If votedFor is null or candidateId, and candidate’s log is
+	//     at least as up-to-date as receiver’s log, grant vote
+	// Reset timer
+	rf.timerFire.Store(false)
+	rf.debug("%s@%d ==> %s@%d", rf.state, rf.currentTerm, FOLLOWER, args.Term)
+	rf.follow(args.CandidateId, args.Term)
+	rf.persist()
+	rf.info("grant: vote candidate %d @%d", args.CandidateId, args.Term)
+	reply.VoteGranted = true
 }
 
 // call with holding lock
@@ -142,11 +142,10 @@ func (rf *Raft) follow(leader, term int) {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
+		// Your code here to check if a leader election should be started and
+		// to randomize sleeping time using time.Sleep().
 		rand.Seed(makeSeed())
-		dura := ELECTION_TIMEOUT_DURATION + rand.Int31n(ELECTION_TIMEOUT_DURATION)
+		dura := ELECTION_TIMEOUT_MINIMUM + rand.Int31n(ELECTION_TIMEOUT_SPAN)
 		term, isleader := rf.GetState()
 
 		// Set timer
@@ -215,20 +214,18 @@ func (rf *Raft) newElection() {
 				if reply.VoteGranted {
 					// Granted
 					ch <- Vote{1, index}
+				} else if args.Term < reply.Term {
+					// Stale, convert to follower
+					rf.mu.Lock()
+					rf.newCmd.L.Lock()
+					rf.follow(NIL_LEADER, reply.Term)
+					rf.persist()
+					rf.newCmd.L.Unlock()
+					rf.mu.Unlock()
+					ch <- Vote{-1, index}
 				} else {
-					if args.Term < reply.Term {
-						// Stale, convert to follower
-						rf.mu.Lock()
-						rf.newCmd.L.Lock()
-						rf.follow(NIL_LEADER, reply.Term)
-						rf.persist()
-						rf.newCmd.L.Unlock()
-						rf.mu.Unlock()
-						ch <- Vote{-1, index}
-					} else {
-						// Rejected
-						ch <- Vote{0, index}
-					}
+					// Rejected
+					ch <- Vote{0, index}
 				}
 			} else {
 				// No reply
@@ -246,6 +243,15 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 	half, votes, resp := all/2, 1, 1
 	// Receive vote response
 	for v := range ch {
+		curterm, isleader := rf.GetState()
+		if curterm > term {
+			// if already in next term
+			if !isleader {
+				rf.warn("stale election @%d, latest @%d, convert to follower",
+					term, curterm)
+			}
+			return
+		}
 		if v.Vote >= 0 {
 			resp++
 			votes += v.Vote
@@ -262,21 +268,15 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 				break
 			}
 		} else {
-			curterm, _ := rf.GetState()
-			if curterm > term {
-				rf.warn("stale election term %d, latest %d, convert to follower",
-					term, curterm)
-				return
-			}
 			rf.warn("no reply from server %d at term %d", v.Server, term)
 		}
 	}
 
 	// Count result
 	rf.mu.Lock()
-	rf.debug("state after election at term %d: %s", term, rf.state)
 	if rf.currentTerm == term {
 		// Still at the same term
+		rf.debug("state after election @%d: %s", term, rf.state)
 		if votes > half {
 			// Win the election
 			rf.state = LEADER
@@ -286,8 +286,8 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			rf.newCmd.L.Lock()
 			rf.persist()
 			rf.newCmd.L.Unlock()
-			go rf.sendHeartbeat(term)
 			rf.mu.Unlock()
+			go rf.sendHeartbeat(term)
 			rf.agreement(term)
 			return
 		} else {
@@ -301,14 +301,18 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 
 func (rf *Raft) sendHeartbeat(term int) {
 	for rf.isLeader.Load() && !rf.killed() {
+		rf.newCmd.L.Lock()
 		rf.applyCmd.L.Lock()
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			Entries:      nil,
 			LeaderCommit: rf.commitIndex,
+			PrevLogIndex: rf.commitIndex,
+			PrevLogTerm:  rf.log[rf.commitIndex].Term,
 		}
 		rf.applyCmd.L.Unlock()
+		rf.newCmd.L.Unlock()
 		for i := range rf.peers {
 			if i == rf.me {
 				continue

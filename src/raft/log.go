@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	RETRY_INTERVAL = time.Millisecond * 100
+	RETRY_INTERVAL = time.Millisecond * 10
 )
 
 type ReplicaLog struct {
@@ -32,19 +32,24 @@ func logStr(log []LogEntry, offset int) string {
 
 func (rf *Raft) applyLog() {
 	rf.applyCmd.L.Lock()
-	last := rf.lastApplied
-	for rf.lastApplied < rf.commitIndex {
-		rf.lastApplied++
-		rf.apply <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied,
+	for !rf.killed() {
+		if rf.lastApplied < rf.commitIndex {
+			last := rf.lastApplied
+			rf.newCmd.L.Lock()
+			for rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				rf.apply <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied,
+				}
+			}
+			rf.newCmd.L.Unlock()
+			rf.debug("applied log[%d:%d]", last+1, rf.lastApplied+1)
 		}
+		rf.applyCmd.Wait()
 	}
-	now := rf.lastApplied
 	rf.applyCmd.L.Unlock()
-	rf.debug("applied log[%d:%d]", last+1, now+1)
-	rf.applyCmd.Signal()
 }
 
 type AppendEntriesArgs struct {
@@ -104,14 +109,20 @@ func (rf *Raft) agreement(term int) {
 	last := next
 
 	// count replicas
-	cnt := 1
 	for rl := range ch {
 		rf.matchIndex[rl.Server] = rl.Index
-		rf.debug("match server %d at log %d@%d, current N = %d",
-			rl.Server, rl.Index, rf.log[rl.Index].Term, last)
-		if rl.Index >= last {
-			cnt++
+		// count >= N, be careful of count the same server multiple times
+		cnt := 1
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			if rf.matchIndex[i] >= last {
+				cnt++
+			}
 		}
+		rf.debug("match server %d at log index %d, now %d servers >= N(%d)",
+			rl.Server, rl.Index, cnt, last)
 		if cnt > half {
 			// advance commit
 			rf.applyCmd.L.Lock()
@@ -119,8 +130,7 @@ func (rf *Raft) agreement(term int) {
 			rf.commitIndex = last
 			rf.info("commit log[%d:%d]", commitStart, last+1)
 			rf.applyCmd.L.Unlock()
-
-			go rf.applyLog()
+			rf.applyCmd.Signal()
 
 			rf.newCmd.L.Lock()
 			if last == len(rf.log)-1 {
@@ -129,7 +139,6 @@ func (rf *Raft) agreement(term int) {
 			}
 			last = len(rf.log) - 1
 			rf.newCmd.L.Unlock()
-			cnt = 1
 		}
 	}
 }
@@ -150,20 +159,20 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			rf.newCmd.L.Unlock()
 			continue
 		}
-		rf.newCmd.L.Unlock()
 		if prev < 0 {
 			prev = 0
 		}
-
-		rf.applyCmd.L.Lock()
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: prev,
 			PrevLogTerm:  rf.log[prev].Term,
 			Entries:      rf.log[next : last+1],
-			LeaderCommit: rf.commitIndex,
 		}
+		rf.newCmd.L.Unlock()
+
+		rf.applyCmd.L.Lock()
+		args.LeaderCommit = rf.commitIndex
 		rf.applyCmd.L.Unlock()
 
 		rf.debug("send log[%d:%d] to follower %d, prev %d@%d, commit %d",
@@ -173,10 +182,17 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 
 		reply := AppendEntriesReply{}
 		if !rf.sendAppendEntries(index, &args, &reply) {
+			if !rf.isLeader.Load() {
+				return
+			}
 			// Failed to issue RPC, retry
 			rf.warn("failed to send RPC to follower %d, retring...", index)
 			time.Sleep(RETRY_INTERVAL)
 			continue
+		}
+		curterm, isleader := rf.GetState()
+		if curterm > term || !isleader {
+			return
 		}
 		if !reply.Success {
 			if reply.Term > args.Term {
@@ -189,26 +205,25 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 					rf.persist()
 					rf.newCmd.L.Unlock()
 					rf.mu.Unlock()
-					// THIS MAY CAUSE DATA RACE AND PANIC ON SENDING CLOSE CHAN
 					close(ch)
 					return
 				}
 				rf.mu.Unlock()
-				break
+				return
 			}
 			nextIndex := rf.nextIndex[index]
+			rf.newCmd.L.Lock()
 			rf.debug("server %d not contain log %d@%d, backoff to %d@%d",
 				index, nextIndex, rf.log[nextIndex].Term,
 				nextIndex-1, rf.log[nextIndex-1].Term)
+			rf.newCmd.L.Unlock()
 			rf.nextIndex[index]--
 			continue
-		}
-
-		rf.info("update nextIndex[%d] from %d to %d at term %d",
-			index, next, last+1, term)
-		// Update follower records
-		rf.nextIndex[index] = last + 1
-		if rf.isLeader.Load() {
+		} else {
+			rf.info("update nextIndex[%d] from %d to %d at term %d",
+				index, next, last+1, term)
+			// Update follower records
+			rf.nextIndex[index] = last + 1
 			ch <- ReplicaLog{last, index}
 		}
 	}
@@ -222,8 +237,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	if rf.currentTerm > args.Term {
-		// Stale leader term
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
 		rf.debug("stale leader %d at term %d, current leader %d at term %d",
 			args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
 		return
@@ -244,6 +259,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
+	prevIndex := args.PrevLogIndex
+
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
+	//    whose term matches prevLogTerm
+	if lastIndex < prevIndex {
+		rf.info("doesn't contain log entry at index %d, expect %d",
+			prevIndex, lastIndex)
+		return
+	}
+
+	// 3. If an existing entry conflicts with a new one (same index but
+	//    different terms), delete the existing entry and all that follow it
+	prevTerm := rf.log[prevIndex].Term
+	if prevTerm != args.PrevLogTerm {
+		rf.log = rf.log[:prevIndex]
+		rf.info("conflict log entry %d@%d, got %d@%d, drop log[%d:]",
+			prevIndex, prevTerm, prevIndex, args.PrevLogTerm, prevIndex)
+		// return false in case of more than one conflict entry
+		return
+	}
 
 	if len(args.Entries) == 0 {
 		// Heartbeat
@@ -256,36 +291,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		rf.debug("PrevLog: %d@%d, lastLog: %d@%d",
 			args.PrevLogIndex, args.PrevLogTerm, lastIndex, lastTerm)
-		rf.debug("%s", logStr(rf.log, 0))
 
-		if lastIndex < args.PrevLogIndex {
-			// Out-of-date entries, request for prev entry
-			rf.info("doesn't contain log entry at index %d, expect %d",
-				args.PrevLogIndex, lastIndex)
-			return
-		}
-
-		prevIndex := args.PrevLogIndex
-		prevTerm := rf.log[prevIndex].Term
-
-		if prevTerm != args.PrevLogTerm {
-			// Conflict term, delete followed entries, request for prev entry
-			rf.log = rf.log[:prevIndex]
-			rf.info("conflict: local entry %d@%d, got %d@%d",
-				prevIndex, prevTerm, args.PrevLogIndex, args.PrevLogTerm)
-			rf.persist()
-			return
-		}
-
-		// Append new entries from index args.PrevLogIndex+1
+		// 4. Append any new entries not already in the log
 		rf.log = append(rf.log[:prevIndex+1], args.Entries...)
-		last := len(rf.log) - 1
-		rf.debug("append log entries at [%d:%d] from leader %d at term %d",
-			prevIndex+1, last+1, args.LeaderId, args.Term)
+		lastIndex := len(rf.log) - 1
+		rf.debug("append at [%d:%d] from leader %d @%d, now lastLog %d@%d",
+			prevIndex+1, lastIndex+1, args.LeaderId, args.Term,
+			lastIndex, rf.log[lastIndex].Term)
 		rf.debug("%s", logStr(rf.log, 0))
 	}
 
-	// Update commit index
+	// 5. If leaderCommit > commitIndex,
+	//    set commitIndex = min(leaderCommit, index of last new entry)
+	rf.applyCmd.L.Lock()
 	oldcommit := rf.commitIndex
 	if oldcommit != lastIndex && args.LeaderCommit > oldcommit {
 		if args.LeaderCommit > lastIndex {
@@ -296,8 +314,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.info("update commit index %d@%d ==> %d@%d",
 			oldcommit, rf.log[oldcommit].Term,
 			rf.commitIndex, rf.log[rf.commitIndex].Term)
-		go rf.applyLog()
+		rf.applyCmd.Signal()
 	}
+	rf.applyCmd.L.Unlock()
 
 	reply.Success = true
 	rf.persist()

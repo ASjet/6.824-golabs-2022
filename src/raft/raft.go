@@ -236,21 +236,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.newCmd.L.Unlock()
 		rf.newCmd.Broadcast()
 		index = next
-		// rf.applyCmd.L.Lock()
-		// index = rf.commitIndex
-		// rf.applyCmd.L.Unlock()
-		// return until commited
-		// for rf.isLeader.Load() && !rf.killed() {
-		// 	rf.applyCmd.L.Lock()
-		// 	if rf.lastApplied > next {
-		// 		rf.applyCmd.L.Unlock()
-		// 		rf.debug("command %d@%d applied, return to client", next, term)
-		// 		break
-		// 	}
-		// 	rf.debug("wait for command %d@%d apply...", next, term)
-		// 	rf.applyCmd.Wait()
-		// 	rf.applyCmd.L.Unlock()
-		// }
 	}
 	return index, term, isLeader
 }
@@ -267,6 +252,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	rf.dead.Store(true)
 	// Your code here, if desired.
+	rf.applyCmd.Broadcast()
+	rf.newCmd.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -307,6 +294,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyLog()
 
 	return rf
 }
