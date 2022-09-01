@@ -48,6 +48,11 @@ func (rf *Raft) applyLog() {
 			rf.newCmd.L.Unlock()
 			rf.debug("applied log[%d:%d]", last+1, rf.lastApplied+1)
 		}
+		rf.mu.Lock()
+		rf.newCmd.L.Lock()
+		rf.persist()
+		rf.newCmd.L.Unlock()
+		rf.mu.Unlock()
 		rf.applyCmd.Wait()
 	}
 	rf.applyCmd.L.Unlock()
@@ -86,7 +91,10 @@ func (rf *Raft) agreement(term int) {
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCmd.L.Unlock()
+	rf.mu.Lock()
 	rf.newCmd.L.Lock()
+	rf.persist()
+	rf.mu.Unlock()
 	next := len(rf.log) - 1
 	if next == 0 {
 		// If there is no log, wait for new command
@@ -326,8 +334,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderId, args.Term)
 		rf.debug("got%s", logStr(args.Entries, args.PrevLogIndex+1))
 
-		rf.debug("PrevLog: %d@%d, lastLog: %d@%d",
-			args.PrevLogIndex, args.PrevLogTerm, lastIndex, lastTerm)
+		rf.debug("PrevLog: %d@%d, lastLog: %d@%d, commit: %d",
+			args.PrevLogIndex, args.PrevLogTerm, lastIndex, lastTerm,
+			args.LeaderCommit)
 
 		// 4. Append any new entries not already in the log
 		rf.log = append(rf.log[:prevIndex+1], args.Entries...)

@@ -282,9 +282,6 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			rf.isLeader.Store(true)
 			rf.info("won the election @%d! got %d/%d/%d votes",
 				term, votes, resp, all)
-			rf.newCmd.L.Lock()
-			rf.persist()
-			rf.newCmd.L.Unlock()
 			rf.mu.Unlock()
 			go rf.sendHeartbeat(term)
 			rf.agreement(term)

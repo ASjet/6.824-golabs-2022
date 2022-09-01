@@ -16,6 +16,9 @@ var infoLogger *log.Logger
 var warningLogger *log.Logger
 
 func init() {
+	if !DEBUG {
+		return
+	}
 	odebug, err := os.Create("debug.log")
 	if LOG_LEVEL < 1 {
 		debugLogger = log.New(os.Stderr, "DEBUG ", log.Ltime|log.Lmicroseconds|log.Lmsgprefix)
