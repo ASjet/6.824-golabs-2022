@@ -60,7 +60,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.debug("new candidate %d at term %d, currently voted %d at term %d",
+	rf.debug("new candidate %d @%d, currently voted %d @%d",
 		args.CandidateId, args.Term, rf.votedFor, rf.currentTerm)
 
 	// Set default reply
@@ -83,11 +83,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
+	oldTerm := rf.currentTerm
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 	rf.debug("LastLog: candidate: %d@%d, local: %d@%d",
 		args.LastLogIndex, args.LastLogTerm, lastIndex, lastTerm)
 	rf.debug("%s", logStr(rf.log, 0))
+
+	// update term to avoid keeping conflict in following election
+	// it is not necessary but can speed up reach agreement
+	rf.currentTerm = args.Term
 
 	// Election restriction:
 	// Candidate's log is at least as up-to-date as receiver's
@@ -96,18 +101,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if lastTerm > args.LastLogTerm {
 		rf.info("reject: expect lastLogTerm at least %d, got %d",
 			lastTerm, args.LastLogTerm)
-		// update term to avoid keeping conflict in following election
-		// NOT SURE if it is necessary
-		// rf.currentTerm = args.Term
 		return
 	}
 	// 2. length of log entries is equal or longer when last term equal
 	if lastTerm == args.LastLogTerm && lastIndex > args.LastLogIndex {
 		rf.info("reject: expect lastLogIndex at least %d, got %d",
 			lastIndex, args.LastLogIndex)
-		// update term
-		// NOT SURE if it is necessary
-		// rf.currentTerm = args.Term
 		return
 	}
 
@@ -115,7 +114,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//     at least as up-to-date as receiver’s log, grant vote
 	// Reset timer
 	rf.timerFire.Store(false)
-	rf.debug("%s@%d ==> %s@%d", rf.state, rf.currentTerm, FOLLOWER, args.Term)
+	rf.debug("%s@%d ==> %s@%d", rf.state, oldTerm, FOLLOWER, args.Term)
 	rf.follow(args.CandidateId, args.Term)
 	rf.persist()
 	rf.info("grant: vote candidate %d @%d", args.CandidateId, args.Term)
@@ -169,7 +168,7 @@ func (rf *Raft) ticker() {
 			case rf.me:
 				rf.info("election of term %d timeout", term)
 			default:
-				rf.info("lost communication with leader %d at term %d",
+				rf.info("lost communication with leader %d @%d",
 					rf.votedFor, term)
 			}
 			rf.mu.Unlock()
@@ -189,7 +188,7 @@ func (rf *Raft) newElection() {
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	rf.info("new election at term %d, lastLog: %d@%d",
+	rf.info("new election @%d, lastLog: %d@%d",
 		rf.currentTerm, args.LastLogIndex, args.LastLogTerm)
 	rf.debug("%s", logStr(rf.log, 0))
 	rf.persist()
@@ -208,7 +207,7 @@ func (rf *Raft) newElection() {
 		}
 		wg.Add(1)
 		go func(index int) {
-			rf.debug("request vote from server %d at term %d", index, args.Term)
+			rf.debug("request vote from server %d @%d", index, args.Term)
 			reply := RequestVoteReply{}
 			if rf.sendRequestVote(index, &args, &reply) {
 				if reply.VoteGranted {
@@ -256,10 +255,10 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			resp++
 			votes += v.Vote
 			if v.Vote == 1 {
-				rf.debug("grant from server %d, now %d/%d/%d votes at term %d",
+				rf.debug("grant from server %d, now %d/%d/%d votes @%d",
 					v.Server, votes, resp, all, term)
 			} else {
-				rf.debug("reject from server %d, now %d/%d/%d votes at term %d",
+				rf.debug("reject from server %d, now %d/%d/%d votes @%d",
 					v.Server, votes, resp, all, term)
 			}
 			if votes > half {
@@ -268,7 +267,7 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 				break
 			}
 		} else {
-			rf.warn("no reply from server %d at term %d", v.Server, term)
+			rf.warn("no reply from server %d @%d", v.Server, term)
 		}
 	}
 
@@ -281,7 +280,7 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			// Win the election
 			rf.state = LEADER
 			rf.isLeader.Store(true)
-			rf.info("won the election at term %d! got %d/%d/%d votes",
+			rf.info("won the election @%d! got %d/%d/%d votes",
 				term, votes, resp, all)
 			rf.newCmd.L.Lock()
 			rf.persist()
@@ -292,7 +291,7 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			return
 		} else {
 			// Lose the election or no winner, wait for winner's heartbeat
-			rf.info("lost the election at term %d, got %d/%d/%d votes",
+			rf.info("lost the election @%d, got %d/%d/%d votes",
 				term, votes, resp, all)
 		}
 	}

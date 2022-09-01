@@ -95,7 +95,7 @@ type Raft struct {
 	// Volatile state on leaders
 	// Reinitialize after election
 	// no lock
-	nextIndex  []int
+	nextIndex  []atomic.Int32
 	matchIndex []int
 
 	/* -----State----- */
@@ -232,6 +232,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		next := len(rf.log)
 		rf.debug("new command %v at log entry %d@%d", command, next, term)
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		rf.persist()
 		rf.debug("%s", logStr(rf.log, 0))
 		rf.newCmd.L.Unlock()
 		rf.newCmd.Broadcast()

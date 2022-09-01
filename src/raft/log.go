@@ -3,6 +3,7 @@ package raft
 import (
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,6 +65,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs,
@@ -76,7 +80,7 @@ func (rf *Raft) agreement(term int) {
 	// init
 	rf.info("init leader states")
 	allPeers := len(rf.peers)
-	rf.nextIndex = make([]int, allPeers)
+	rf.nextIndex = make([]atomic.Int32, allPeers)
 	rf.matchIndex = make([]int, allPeers)
 	rf.applyCmd.L.Lock()
 	rf.commitIndex = 0
@@ -100,7 +104,7 @@ func (rf *Raft) agreement(term int) {
 		if i == rf.me {
 			continue
 		}
-		rf.nextIndex[i] = next
+		rf.nextIndex[i].Store(int32(next))
 		rf.matchIndex[i] = 0
 		go rf.agreementWith(term, i, ch)
 	}
@@ -144,11 +148,11 @@ func (rf *Raft) agreement(term int) {
 }
 
 func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
-	rf.info("establish agreement with follower %d at term %d", index, term)
+	rf.info("establish agreement with follower %d @%d", index, term)
 	for rf.isLeader.Load() && !rf.killed() {
 		rf.newCmd.L.Lock()
 		last := len(rf.log) - 1
-		next := rf.nextIndex[index]
+		next := int(rf.nextIndex[index].Load())
 		prev := next - 1
 
 		if next > 0 && last-next < 0 {
@@ -195,6 +199,7 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			return
 		}
 		if !reply.Success {
+			// Stale leader
 			if reply.Term > args.Term {
 				rf.mu.Lock()
 				if rf.isLeader.Load() {
@@ -211,19 +216,40 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 				rf.mu.Unlock()
 				return
 			}
-			nextIndex := rf.nextIndex[index]
+			// Follower doesn't contain the entry at prevLogIndex
+			if args.PrevLogIndex > reply.XLen {
+				rf.nextIndex[index].Store(int32(reply.XLen + 1))
+				rf.debug("server %d doesn't contain log at %d, backoff to %d",
+					index, args.PrevLogIndex, reply.XLen)
+				continue
+			}
+			// Follower contain conflict entry at prevLogIndex
 			rf.newCmd.L.Lock()
-			rf.debug("server %d not contain log %d@%d, backoff to %d@%d",
-				index, nextIndex, rf.log[nextIndex].Term,
-				nextIndex-1, rf.log[nextIndex-1].Term)
+			oldNextIndex := rf.nextIndex[index].Load()
+			if rf.log[reply.XIndex].Term == reply.XTerm {
+				// The leader has entries at term reply.XTerm
+				// Get the last index of log entry at term reply.XTerm
+				for i := reply.XIndex; i < reply.XLen; i++ {
+					if rf.log[i+1].Term > reply.XTerm {
+						rf.nextIndex[index].Store(int32(i))
+						break
+					}
+				}
+			} else {
+				// The leader doesn't have entry at term reply.XTerm
+				rf.nextIndex[index].Store(int32(reply.XIndex))
+			}
+			newNextIndex := rf.nextIndex[index].Load()
+			rf.debug("server %d has conflict log %d@%d, backoff to %d@%d",
+				index, oldNextIndex-1, reply.XTerm,
+				newNextIndex-1, rf.log[newNextIndex-1].Term)
 			rf.newCmd.L.Unlock()
-			rf.nextIndex[index]--
 			continue
 		} else {
-			rf.info("update nextIndex[%d] from %d to %d at term %d",
+			rf.info("update nextIndex[%d] from %d to %d @%d",
 				index, next, last+1, term)
 			// Update follower records
-			rf.nextIndex[index] = last + 1
+			rf.nextIndex[index].Store(int32(last + 1))
 			ch <- ReplicaLog{last, index}
 		}
 	}
@@ -239,7 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		rf.debug("stale leader %d at term %d, current leader %d at term %d",
+		rf.debug("stale leader %d @%d, current leader %d @%d",
 			args.LeaderId, args.Term, rf.votedFor, rf.currentTerm)
 		return
 	}
@@ -247,7 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.timerFire.Store(false)
 
 	if rf.currentTerm < args.Term || rf.votedFor != args.LeaderId {
-		rf.info("new leader %d at term %d", args.LeaderId, args.Term)
+		rf.info("new leader %d @%d", args.LeaderId, args.Term)
 		rf.follow(args.LeaderId, args.Term)
 	}
 
@@ -258,6 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.newCmd.L.Unlock()
 
 	lastIndex := len(rf.log) - 1
+	reply.XLen = lastIndex
 	lastTerm := rf.log[lastIndex].Term
 	prevIndex := args.PrevLogIndex
 
@@ -277,15 +304,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.info("conflict log entry %d@%d, got %d@%d, drop log[%d:]",
 			prevIndex, prevTerm, prevIndex, args.PrevLogTerm, prevIndex)
 		// return false in case of more than one conflict entry
+		reply.XTerm = prevTerm
+		reply.XIndex = 1
+		for i := prevIndex; i > 0; i-- {
+			if rf.log[i-1].Term < prevTerm {
+				reply.XIndex = i
+				break
+			}
+		}
 		return
 	}
 
+	reply.Success = true
+
 	if len(args.Entries) == 0 {
 		// Heartbeat
-		rf.debug("heartbeat from leader %d at term %d",
+		rf.debug("heartbeat from leader %d @%d",
 			args.LeaderId, args.Term)
 	} else {
-		rf.debug("new entries from leader %d at term %d",
+		rf.debug("new entries from leader %d @%d",
 			args.LeaderId, args.Term)
 		rf.debug("got%s", logStr(args.Entries, args.PrevLogIndex+1))
 
@@ -317,7 +354,5 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCmd.Signal()
 	}
 	rf.applyCmd.L.Unlock()
-
-	reply.Success = true
 	rf.persist()
 }
