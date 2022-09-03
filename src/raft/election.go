@@ -11,8 +11,8 @@ const (
 	FOLLOWER
 	CANDIDATE
 	NIL_LEADER               = -1
-	ELECTION_TIMEOUT_MINIMUM = 300 // ms
-	ELECTION_TIMEOUT_SPAN    = 500 // ms
+	ELECTION_TIMEOUT_MINIMUM = 200 // ms
+	ELECTION_TIMEOUT_SPAN    = 200 // ms
 	HEARTBEAT_INTERVAL       = 150 //ms
 )
 
@@ -297,8 +297,8 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 
 func (rf *Raft) sendHeartbeat(term int) {
 	for rf.isLeader.Load() && !rf.killed() {
-		rf.newCmd.L.Lock()
 		rf.applyCmd.L.Lock()
+		rf.newCmd.L.Lock()
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
@@ -307,8 +307,8 @@ func (rf *Raft) sendHeartbeat(term int) {
 			PrevLogIndex: rf.commitIndex,
 			PrevLogTerm:  rf.log[rf.commitIndex].Term,
 		}
-		rf.applyCmd.L.Unlock()
 		rf.newCmd.L.Unlock()
+		rf.applyCmd.L.Unlock()
 		for i := range rf.peers {
 			if i == rf.me {
 				continue

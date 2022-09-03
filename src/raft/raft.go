@@ -191,6 +191,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	term, isLeader := rf.GetState()
 	if isLeader {
+		rf.mu.Lock()
 		rf.newCmd.L.Lock()
 		next := len(rf.log)
 		rf.debug("new command %v at log entry %d@%d", command, next, term)
@@ -198,6 +199,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.debug("%s", logStr(rf.log, 0))
 		rf.newCmd.L.Unlock()
+		rf.mu.Unlock()
 		rf.newCmd.Broadcast()
 		index = next
 	}

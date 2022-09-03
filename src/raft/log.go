@@ -4,11 +4,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
-)
-
-const (
-	RETRY_INTERVAL = time.Millisecond * 10
 )
 
 type ReplicaLog struct {
@@ -48,11 +43,7 @@ func (rf *Raft) applyLog() {
 			rf.newCmd.L.Unlock()
 			rf.debug("applied log[%d:%d]", last+1, rf.lastApplied+1)
 		}
-		rf.mu.Lock()
-		rf.newCmd.L.Lock()
-		rf.persist()
-		rf.newCmd.L.Unlock()
-		rf.mu.Unlock()
+		rf.debug("wait for new apply")
 		rf.applyCmd.Wait()
 	}
 	rf.applyCmd.L.Unlock()
@@ -84,17 +75,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs,
 func (rf *Raft) agreement(term int) {
 	// init
 	rf.info("init leader states")
+
+	rf.mu.Lock()
+	rf.newCmd.L.Lock()
+	rf.persist()
+	rf.newCmd.L.Unlock()
+	rf.mu.Unlock()
+
 	allPeers := len(rf.peers)
 	rf.nextIndex = make([]atomic.Int32, allPeers)
 	rf.matchIndex = make([]int, allPeers)
+
 	rf.applyCmd.L.Lock()
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCmd.L.Unlock()
-	rf.mu.Lock()
+
 	rf.newCmd.L.Lock()
-	rf.persist()
-	rf.mu.Unlock()
 	next := len(rf.log) - 1
 	if next == 0 {
 		// If there is no log, wait for new command
@@ -104,6 +101,7 @@ func (rf *Raft) agreement(term int) {
 	next = len(rf.log) - 1
 	rf.info("Start establish agreement at")
 	rf.debug("%s", logStr(rf.log, 0))
+
 	rf.newCmd.L.Unlock()
 
 	ch := make(chan ReplicaLog)
@@ -199,7 +197,6 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			}
 			// Failed to issue RPC, retry
 			rf.warn("failed to send RPC to follower %d, retring...", index)
-			time.Sleep(RETRY_INTERVAL)
 			continue
 		}
 		curterm, isleader := rf.GetState()
@@ -288,6 +285,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Sync log entries, assert (lastIndex <= PrevLogIndex) or
 	// (lastTerm < PrevLogTerm && lastIndex > args.PrevLogIndex)
 	// due to Election Restriction
+	rf.applyCmd.L.Lock()
+	defer rf.applyCmd.L.Unlock()
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
 
@@ -349,7 +348,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 5. If leaderCommit > commitIndex,
 	//    set commitIndex = min(leaderCommit, index of last new entry)
-	rf.applyCmd.L.Lock()
 	oldcommit := rf.commitIndex
 	if oldcommit != lastIndex && args.LeaderCommit > oldcommit {
 		if args.LeaderCommit > lastIndex {
@@ -362,6 +360,5 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex, rf.log[rf.commitIndex].Term)
 		rf.applyCmd.Signal()
 	}
-	rf.applyCmd.L.Unlock()
 	rf.persist()
 }
