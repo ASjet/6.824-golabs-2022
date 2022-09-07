@@ -36,7 +36,7 @@ func (rf *Raft) applyLog() {
 				rf.lastApplied++
 				rf.apply <- ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
+					Command:      rf.log[rf.lastApplied-rf.offset].Command,
 					CommandIndex: rf.lastApplied,
 				}
 			}
@@ -92,19 +92,19 @@ func (rf *Raft) agreement(term int) {
 	rf.applyCmd.L.Unlock()
 
 	rf.newCmd.L.Lock()
-	next := len(rf.log) - 1
+	next := len(rf.log) - 1 + rf.offset
 	if next == 0 {
 		// If there is no log, wait for new command
 		rf.debug("log is empty, wait for new command")
 		rf.newCmd.Wait()
 	}
-	next = len(rf.log) - 1
+	next = len(rf.log) - 1 + rf.offset
 	rf.info("Start establish agreement at")
-	rf.debug("%s", logStr(rf.log, 0))
+	rf.debug("%s", logStr(rf.log, rf.offset))
 
 	rf.newCmd.L.Unlock()
 
-	ch := make(chan ReplicaLog)
+	ch := make(chan ReplicaLog, allPeers)
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -143,13 +143,16 @@ func (rf *Raft) agreement(term int) {
 			rf.applyCmd.Signal()
 
 			rf.newCmd.L.Lock()
-			if last == len(rf.log)-1 {
+			if last == len(rf.log)-1+rf.offset {
 				rf.debug("no log need to be commit, wait for new command")
 				rf.newCmd.Wait()
 			}
-			last = len(rf.log) - 1
+			last = len(rf.log) - 1 + rf.offset
 			rf.newCmd.L.Unlock()
 		}
+	}
+	for range ch {
+		// Drain the channel
 	}
 }
 
@@ -157,14 +160,14 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 	rf.info("establish agreement with follower %d @%d", index, term)
 	for rf.isLeader.Load() && !rf.killed() {
 		rf.newCmd.L.Lock()
-		last := len(rf.log) - 1
+		last := len(rf.log) - 1 + rf.offset
 		next := int(rf.nextIndex[index].Load())
 		prev := next - 1
 
 		if next > 0 && last-next < 0 {
 			// Wait for new command arrive
 			rf.debug("nextIndex: %d, lastLog: %d@%d, wait for new command...",
-				next, last, rf.log[last].Term)
+				next, last, rf.log[last-rf.offset].Term)
 			rf.newCmd.Wait()
 			rf.newCmd.L.Unlock()
 			continue
@@ -176,8 +179,8 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: prev,
-			PrevLogTerm:  rf.log[prev].Term,
-			Entries:      rf.log[next : last+1],
+			PrevLogTerm:  rf.log[prev-rf.offset].Term,
+			Entries:      rf.log[next-rf.offset : last+1-rf.offset],
 		}
 		rf.newCmd.L.Unlock()
 
@@ -231,11 +234,11 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			// Follower contain conflict entry at prevLogIndex
 			rf.newCmd.L.Lock()
 			oldNextIndex := rf.nextIndex[index].Load()
-			if rf.log[reply.XIndex].Term == reply.XTerm {
+			if rf.log[reply.XIndex-rf.offset].Term == reply.XTerm {
 				// The leader has entries at term reply.XTerm
 				// Get the last index of log entry at term reply.XTerm
 				for i := reply.XIndex; i < reply.XLen; i++ {
-					if rf.log[i+1].Term > reply.XTerm {
+					if rf.log[i+1-rf.offset].Term > reply.XTerm {
 						rf.nextIndex[index].Store(int32(i))
 						break
 					}
@@ -247,7 +250,7 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			newNextIndex := rf.nextIndex[index].Load()
 			rf.debug("server %d has conflict log %d@%d, backoff to %d@%d",
 				index, oldNextIndex-1, reply.XTerm,
-				newNextIndex-1, rf.log[newNextIndex-1].Term)
+				newNextIndex-1, rf.log[newNextIndex-1-int32(rf.offset)].Term)
 			rf.newCmd.L.Unlock()
 			continue
 		} else {
@@ -290,9 +293,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
 
-	lastIndex := len(rf.log) - 1
+	lastIndex := len(rf.log) - 1 + rf.offset
 	reply.XLen = lastIndex
-	lastTerm := rf.log[lastIndex].Term
+	lastTerm := rf.log[lastIndex-rf.offset].Term
 	prevIndex := args.PrevLogIndex
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -305,16 +308,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 3. If an existing entry conflicts with a new one (same index but
 	//    different terms), delete the existing entry and all that follow it
-	prevTerm := rf.log[prevIndex].Term
+	prevTerm := rf.log[prevIndex-rf.offset].Term
 	if prevTerm != args.PrevLogTerm {
-		rf.log = rf.log[:prevIndex]
+		rf.log = rf.log[:prevIndex-rf.offset]
 		rf.info("conflict log entry %d@%d, got %d@%d, drop log[%d:]",
 			prevIndex, prevTerm, prevIndex, args.PrevLogTerm, prevIndex)
 		// return false in case of more than one conflict entry
 		reply.XTerm = prevTerm
 		reply.XIndex = 1
 		for i := prevIndex; i > 0; i-- {
-			if rf.log[i-1].Term < prevTerm {
+			if rf.log[i-1-rf.offset].Term < prevTerm {
 				reply.XIndex = i
 				break
 			}
@@ -338,12 +341,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderCommit)
 
 		// 4. Append any new entries not already in the log
-		rf.log = append(rf.log[:prevIndex+1], args.Entries...)
-		lastIndex := len(rf.log) - 1
+		rf.log = append(rf.log[:prevIndex+1-rf.offset], args.Entries...)
+		lastIndex := len(rf.log) - 1 + rf.offset
 		rf.debug("append at [%d:%d] from leader %d @%d, now lastLog %d@%d",
 			prevIndex+1, lastIndex+1, args.LeaderId, args.Term,
-			lastIndex, rf.log[lastIndex].Term)
-		rf.debug("%s", logStr(rf.log, 0))
+			lastIndex, rf.log[lastIndex-rf.offset].Term)
+		rf.debug("%s", logStr(rf.log, rf.offset))
 	}
 
 	// 5. If leaderCommit > commitIndex,
@@ -356,8 +359,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = args.LeaderCommit
 		}
 		rf.info("update commit index %d@%d ==> %d@%d",
-			oldcommit, rf.log[oldcommit].Term,
-			rf.commitIndex, rf.log[rf.commitIndex].Term)
+			oldcommit, rf.log[oldcommit-rf.offset].Term,
+			rf.commitIndex, rf.log[rf.commitIndex-rf.offset].Term)
 		rf.applyCmd.Signal()
 	}
 	rf.persist()

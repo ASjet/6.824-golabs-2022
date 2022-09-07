@@ -82,7 +82,8 @@ type Raft struct {
 	votedFor    int
 
 	// hold newCmd lock
-	log []LogEntry
+	log    []LogEntry
+	offset int
 
 	// Volatile state on all servers
 	// hold applyCmd lock
@@ -135,25 +136,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
-	snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
-}
-
 // The labrpc package simulates a lossy network, in which servers
 // may be unreachable, and in which requests and replies may be lost.
 // Call() sends a request and waits for a reply. If a reply arrives
@@ -193,11 +175,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.mu.Lock()
 		rf.newCmd.L.Lock()
-		next := len(rf.log)
+		next := len(rf.log) + rf.offset
 		rf.debug("new command %v at log entry %d@%d", command, next, term)
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
 		rf.persist()
-		rf.debug("%s", logStr(rf.log, 0))
+		rf.debug("%s", logStr(rf.log, rf.offset))
 		rf.newCmd.L.Unlock()
 		rf.mu.Unlock()
 		rf.newCmd.Broadcast()
@@ -252,6 +234,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = NIL_LEADER
 	rf.log = []LogEntry{{0, nil}}
+	rf.offset = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 

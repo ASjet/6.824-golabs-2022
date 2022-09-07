@@ -12,7 +12,7 @@ const (
 	CANDIDATE
 	NIL_LEADER               = -1
 	ELECTION_TIMEOUT_MINIMUM = 200 // ms
-	ELECTION_TIMEOUT_SPAN    = 200 // ms
+	ELECTION_TIMEOUT_SPAN    = 300 // ms
 	HEARTBEAT_INTERVAL       = 150 //ms
 )
 
@@ -84,11 +84,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
 	oldTerm := rf.currentTerm
-	lastIndex := len(rf.log) - 1
-	lastTerm := rf.log[lastIndex].Term
+	lastIndex := len(rf.log) - 1 + rf.offset
+	lastTerm := rf.log[lastIndex-rf.offset].Term
 	rf.debug("LastLog: candidate: %d@%d, local: %d@%d",
 		args.LastLogIndex, args.LastLogTerm, lastIndex, lastTerm)
-	rf.debug("%s", logStr(rf.log, 0))
+	rf.debug("%s", logStr(rf.log, rf.offset))
 
 	// update term to avoid keeping conflict in following election
 	// it is not necessary but can speed up reach agreement
@@ -185,17 +185,17 @@ func (rf *Raft) newElection() {
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
+		LastLogIndex: len(rf.log) - 1 + rf.offset,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 	rf.info("new election @%d, lastLog: %d@%d",
 		rf.currentTerm, args.LastLogIndex, args.LastLogTerm)
-	rf.debug("%s", logStr(rf.log, 0))
+	rf.debug("%s", logStr(rf.log, rf.offset))
 	rf.persist()
 	rf.newCmd.L.Unlock()
 	rf.mu.Unlock()
 
-	ch := make(chan Vote)
+	ch := make(chan Vote, len(rf.peers))
 	go rf.rollVote(ch, args.Term)
 
 	wg := sync.WaitGroup{}
@@ -271,6 +271,12 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 		}
 	}
 
+	// Drain the channel
+	go func() {
+		for range ch {
+		}
+	}()
+
 	// Count result
 	rf.mu.Lock()
 	if rf.currentTerm == term {
@@ -305,7 +311,7 @@ func (rf *Raft) sendHeartbeat(term int) {
 			Entries:      nil,
 			LeaderCommit: rf.commitIndex,
 			PrevLogIndex: rf.commitIndex,
-			PrevLogTerm:  rf.log[rf.commitIndex].Term,
+			PrevLogTerm:  rf.log[rf.commitIndex-rf.offset].Term,
 		}
 		rf.newCmd.L.Unlock()
 		rf.applyCmd.L.Unlock()

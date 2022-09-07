@@ -17,6 +17,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.offset)
 	rf.persister.SaveRaftState(buf.Bytes())
 }
 
@@ -29,15 +30,17 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	buf := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(buf)
-	var term, voted int
+	var term, voted, offset int
 	var log []LogEntry
 	if d.Decode(&term) != nil ||
 		d.Decode(&voted) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&offset) != nil {
 		rf.warn("unable to read persist data")
 	} else {
 		rf.currentTerm = term
 		rf.votedFor = voted
 		rf.log = log
+		rf.offset = offset
 	}
 }
