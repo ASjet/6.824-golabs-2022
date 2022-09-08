@@ -55,6 +55,7 @@ type LogEntry struct {
 }
 
 // A Go object implementing a single Raft peer.
+// Lock order: mu > applyCmd > newCmd
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -97,8 +98,65 @@ type Raft struct {
 	matchIndex []int
 
 	/* -----State----- */
-	snapshotBuf []byte
-	ss          *sync.Mutex
+}
+
+func (rf *Raft) getLog(index int) (int, interface{}) {
+	var log LogEntry
+	if index < 0 {
+		log = rf.log[len(rf.log)+index]
+	} else {
+		log = rf.log[index-rf.offset]
+	}
+	return log.Term, log.Command
+}
+
+func (rf *Raft) getLogTerm(index int) int {
+	term, _ := rf.getLog(index)
+	return term
+}
+
+func (rf *Raft) getLogCmd(index int) interface{} {
+	_, cmd := rf.getLog(index)
+	return cmd
+}
+
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.log) + rf.offset - 1
+}
+
+func (rf *Raft) logSlice(start, end int) []LogEntry {
+	l := len(rf.log)
+	so := start - rf.offset
+	eo := end - rf.offset
+	if so < 0 || eo > l {
+		log.Panicf("invalid slice range [%d:%d], offset: %d, log len: %d",
+			start, end, rf.offset, l)
+	}
+	return rf.log[so:eo]
+}
+
+// start == -1 or end == -1
+func (rf *Raft) trimLog(start, end int) {
+	l := len(rf.log)
+	if start == -1 {
+		eo := end - rf.offset
+		if eo < 0 || eo > l {
+			log.Panicf("invalid trim range [:%d], offset: %d, log len: %d",
+				end, rf.offset, l)
+		}
+		rf.log = rf.log[eo:]
+		rf.offset = end
+		return
+	}
+	if end == -1 {
+		so := start - rf.offset
+		if so < 0 || so > l {
+			log.Panicf("invalid trim range [%d:], offset: %d, log len: %d",
+				start, rf.offset, l)
+		}
+		rf.log = rf.log[:so]
+		return
+	}
 }
 
 func (rf *Raft) dprintf(logger *log.Logger, fmts string, args ...any) {
@@ -179,6 +237,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		next := len(rf.log) + rf.offset
 		rf.debug("new command %v at log entry %d@%d", command, next, term)
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
+		rf.debug("new log length %d", len(rf.log))
 		rf.persist()
 		rf.debug("%s", logStr(rf.log, rf.offset))
 		rf.newCmd.L.Unlock()
@@ -238,11 +297,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.offset = 0
-	rf.snapshotBuf = []byte{}
-	rf.ss = &sync.Mutex{}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
 	rf.commitIndex = rf.offset
 	rf.lastApplied = rf.offset
 

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -33,10 +34,15 @@ func (rf *Raft) applyLog() {
 			last := rf.lastApplied
 			rf.newCmd.L.Lock()
 			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
+				if rf.lastApplied < rf.offset {
+					rf.lastApplied = rf.offset
+				} else {
+					rf.lastApplied++
+				}
 				msg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[rf.lastApplied-rf.offset].Command,
+					// Command:      rf.log[rf.lastApplied-rf.offset].Command,
+					Command:      rf.getLogCmd(rf.lastApplied),
 					CommandIndex: rf.lastApplied,
 				}
 				// release newCmd while waiting for sending message to channel
@@ -96,13 +102,15 @@ func (rf *Raft) agreement(term int) {
 	rf.applyCmd.L.Unlock()
 
 	rf.newCmd.L.Lock()
-	next := len(rf.log) - 1 + rf.offset
+	// next := len(rf.log) - 1 + rf.offset
+	next := rf.lastLogIndex()
 	if next == 0 {
 		// If there is no log, wait for new command
 		rf.debug("log is empty, wait for new command")
 		rf.newCmd.Wait()
 	}
-	next = len(rf.log) - 1 + rf.offset
+	// next = len(rf.log) - 1 + rf.offset
+	next = rf.lastLogIndex()
 	rf.info("Start establish agreement at")
 	rf.debug("%s", logStr(rf.log, rf.offset))
 
@@ -147,11 +155,13 @@ func (rf *Raft) agreement(term int) {
 			rf.applyCmd.Signal()
 
 			rf.newCmd.L.Lock()
-			if last == len(rf.log)-1+rf.offset {
+			// if last == len(rf.log)-1+rf.offset {
+			if last == rf.lastLogIndex() {
 				rf.debug("no log need to be commit, wait for new command")
 				rf.newCmd.Wait()
 			}
-			last = len(rf.log) - 1 + rf.offset
+			// last = len(rf.log) - 1 + rf.offset
+			last = rf.lastLogIndex()
 			rf.newCmd.L.Unlock()
 		}
 	}
@@ -164,14 +174,15 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 	rf.info("establish agreement with follower %d @%d", index, term)
 	for rf.isLeader.Load() && !rf.killed() {
 		rf.newCmd.L.Lock()
-		last := len(rf.log) - 1 + rf.offset
+		// last := len(rf.log) - 1 + rf.offset
+		last := rf.lastLogIndex()
 		next := int(rf.nextIndex[index].Load())
 		prev := next - 1
 
 		if next > 0 && last-next < 0 {
 			// Wait for new command arrive
 			rf.debug("nextIndex: %d, lastLog: %d@%d, wait for new command...",
-				next, last, rf.log[last-rf.offset].Term)
+				next, last, rf.getLogTerm(last))
 			rf.newCmd.Wait()
 			rf.newCmd.L.Unlock()
 			continue
@@ -179,12 +190,66 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 		if prev < 0 {
 			prev = 0
 		}
+		if rf.offset > 0 && prev-rf.offset < 0 {
+			// the entry is not in current logs, send snapshot instead
+			args := SnapshotArgs{
+				Term:      term,
+				LeaderId:  rf.me,
+				LastIndex: rf.offset,
+				LastTerm:  rf.log[0].Term,
+				Offset:    0,
+				Data:      rf.persister.ReadSnapshot(),
+				Done:      true,
+			}
+			reply := SnapshotReply{}
+			rf.debug("send snapshot %d@%d to follower %d",
+				args.LastIndex, args.LastTerm, index)
+			rf.newCmd.L.Unlock()
+			if !rf.sendInstallSnapshot(index, &args, &reply) {
+				if !rf.isLeader.Load() {
+					return
+				}
+				// Failed to issue RPC, retry
+				rf.warn("failed to send installSnapshot to follower %d, retring...", index)
+				continue
+			}
+			curterm, isleader := rf.GetState()
+			if curterm > term || !isleader {
+				return
+			}
+			// Stale leader
+			if reply.Term > args.Term {
+				rf.mu.Lock()
+				if rf.isLeader.Load() {
+					rf.warn("stale term %d, latest %d, convert to follower",
+						args.Term, reply.Term)
+					rf.follow(NIL_LEADER, reply.Term)
+					rf.newCmd.L.Lock()
+					rf.persist()
+					rf.newCmd.L.Unlock()
+					rf.mu.Unlock()
+					close(ch)
+					return
+				}
+				rf.mu.Unlock()
+				return
+			}
+
+			rf.info("update nextIndex[%d] from %d to %d @%d",
+				index, next, last+1, term)
+			// Update follower records
+			rf.nextIndex[index].Store(int32(last + 1))
+			ch <- ReplicaLog{last, index}
+			continue
+		}
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			PrevLogIndex: prev,
-			PrevLogTerm:  rf.log[prev-rf.offset].Term,
-			Entries:      rf.log[next-rf.offset : last+1-rf.offset],
+			// PrevLogTerm:  rf.log[prev-rf.offset].Term,
+			// Entries:      rf.log[next-rf.offset : last+1-rf.offset],
+			PrevLogTerm: rf.getLogTerm(prev),
+			Entries:     rf.logSlice(next, last+1),
 		}
 		rf.newCmd.L.Unlock()
 
@@ -203,7 +268,7 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 				return
 			}
 			// Failed to issue RPC, retry
-			rf.warn("failed to send RPC to follower %d, retring...", index)
+			rf.warn("failed to send AppendEntries to follower %d, retring...", index)
 			continue
 		}
 		curterm, isleader := rf.GetState()
@@ -236,13 +301,19 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 				continue
 			}
 			// Follower contain conflict entry at prevLogIndex
+			if rf.offset > reply.XIndex {
+				// send snapshot
+				continue
+			}
 			rf.newCmd.L.Lock()
 			oldNextIndex := rf.nextIndex[index].Load()
-			if rf.log[reply.XIndex-rf.offset].Term == reply.XTerm {
+			// if rf.log[reply.XIndex-rf.offset].Term == reply.XTerm {
+			if rf.getLogTerm(reply.XIndex) == reply.XTerm {
 				// The leader has entries at term reply.XTerm
 				// Get the last index of log entry at term reply.XTerm
 				for i := reply.XIndex; i < reply.XLen; i++ {
-					if rf.log[i+1-rf.offset].Term > reply.XTerm {
+					// if rf.log[i+1-rf.offset].Term > reply.XTerm {
+					if rf.getLogTerm(i+1) > reply.XTerm {
 						rf.nextIndex[index].Store(int32(i))
 						break
 					}
@@ -254,7 +325,8 @@ func (rf *Raft) agreementWith(term, index int, ch chan ReplicaLog) {
 			newNextIndex := rf.nextIndex[index].Load()
 			rf.debug("server %d has conflict log %d@%d, backoff to %d@%d",
 				index, oldNextIndex-1, reply.XTerm,
-				newNextIndex-1, rf.log[newNextIndex-1-int32(rf.offset)].Term)
+				// newNextIndex-1, rf.log[newNextIndex-1-int32(rf.offset)].Term)
+				newNextIndex-1, rf.getLogTerm(int(newNextIndex)-1))
 			rf.newCmd.L.Unlock()
 			continue
 		} else {
@@ -297,9 +369,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
 
-	lastIndex := len(rf.log) - 1 + rf.offset
+	// lastIndex := len(rf.log) - 1 + rf.offset
+	lastIndex := rf.lastLogIndex()
+	if lastIndex < 0 {
+		lastIndex = rf.offset
+	}
 	reply.XLen = lastIndex
-	lastTerm := rf.log[lastIndex-rf.offset].Term
+	if lastIndex-rf.offset < 0 {
+		fmt.Printf("lastIndex: %d, rf.offset: %d, log length: %d\n",
+			lastIndex, rf.offset, len(rf.log))
+	}
+	// lastTerm := rf.log[lastIndex-rf.offset].Term
+	lastTerm := rf.getLogTerm(lastIndex)
 	prevIndex := args.PrevLogIndex
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -312,16 +393,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 3. If an existing entry conflicts with a new one (same index but
 	//    different terms), delete the existing entry and all that follow it
-	prevTerm := rf.log[prevIndex-rf.offset].Term
+	// prevTerm := rf.log[prevIndex-rf.offset].Term
+	prevTerm := rf.getLogTerm(prevIndex)
 	if prevTerm != args.PrevLogTerm {
-		rf.log = rf.log[:prevIndex-rf.offset]
+		// rf.log = rf.log[:prevIndex-rf.offset]
+		rf.trimLog(prevIndex, -1)
+		if len(rf.log) == 0 {
+			rf.log = []LogEntry{{0, nil}}
+		}
 		rf.info("conflict log entry %d@%d, got %d@%d, drop log[%d:]",
 			prevIndex, prevTerm, prevIndex, args.PrevLogTerm, prevIndex)
+		rf.debug("new log length %d", len(rf.log))
 		// return false in case of more than one conflict entry
 		reply.XTerm = prevTerm
 		reply.XIndex = 1
-		for i := prevIndex; i > 0; i-- {
-			if rf.log[i-1-rf.offset].Term < prevTerm {
+		for i := prevIndex; i-rf.offset > 0; i-- {
+			// if rf.log[i-1-rf.offset].Term < prevTerm {
+			if rf.getLogTerm(i-1) < prevTerm {
 				reply.XIndex = i
 				break
 			}
@@ -345,11 +433,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderCommit)
 
 		// 4. Append any new entries not already in the log
-		rf.log = append(rf.log[:prevIndex+1-rf.offset], args.Entries...)
-		lastIndex := len(rf.log) - 1 + rf.offset
+		rf.trimLog(prevIndex+1, -1)
+		rf.log = append(rf.log, args.Entries...)
+		// lastIndex := len(rf.log) - 1 + rf.offset
+		lastIndex := rf.lastLogIndex()
 		rf.debug("append at [%d:%d] from leader %d @%d, now lastLog %d@%d",
 			prevIndex+1, lastIndex+1, args.LeaderId, args.Term,
-			lastIndex, rf.log[lastIndex-rf.offset].Term)
+			// lastIndex, rf.log[lastIndex-rf.offset].Term)
+			lastIndex, rf.getLogTerm(lastIndex))
+		rf.debug("new log length %d", len(rf.log))
 		rf.debug("%s", logStr(rf.log, rf.offset))
 	}
 
@@ -364,7 +456,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.info("update commit index %d@%d ==> %d@%d",
 			oldcommit, rf.log[oldcommit-rf.offset].Term,
-			rf.commitIndex, rf.log[rf.commitIndex-rf.offset].Term)
+			// rf.commitIndex, rf.log[rf.commitIndex-rf.offset].Term)
+			rf.commitIndex, rf.getLogTerm(rf.commitIndex))
 		rf.applyCmd.Signal()
 	}
 	rf.persist()

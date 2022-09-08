@@ -84,8 +84,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.newCmd.L.Lock()
 	defer rf.newCmd.L.Unlock()
 	oldTerm := rf.currentTerm
-	lastIndex := len(rf.log) - 1 + rf.offset
-	lastTerm := rf.log[lastIndex-rf.offset].Term
+	// lastIndex := len(rf.log) - 1 + rf.offset
+	// lastTerm := rf.log[lastIndex-rf.offset].Term
+	lastIndex := rf.lastLogIndex()
+	lastTerm := rf.getLogTerm(lastIndex)
 	rf.debug("LastLog: candidate: %d@%d, local: %d@%d",
 		args.LastLogIndex, args.LastLogTerm, lastIndex, lastTerm)
 	rf.debug("%s", logStr(rf.log, rf.offset))
@@ -183,10 +185,12 @@ func (rf *Raft) newElection() {
 	rf.newCmd.L.Lock()
 	rf.follow(rf.me, rf.currentTerm+1)
 	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1 + rf.offset,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+		// LastLogIndex: len(rf.log) - 1 + rf.offset,
+		// LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: rf.lastLogIndex(),
+		LastLogTerm:  rf.getLogTerm(-1),
 	}
 	rf.info("new election @%d, lastLog: %d@%d",
 		rf.currentTerm, args.LastLogIndex, args.LastLogTerm)
@@ -305,13 +309,19 @@ func (rf *Raft) sendHeartbeat(term int) {
 	for rf.isLeader.Load() && !rf.killed() {
 		rf.applyCmd.L.Lock()
 		rf.newCmd.L.Lock()
+		commitIndex := rf.commitIndex
+		// if commited index is smaller than offset, send offset
+		if commitIndex < rf.offset {
+			commitIndex = rf.offset
+		}
 		args := AppendEntriesArgs{
 			Term:         term,
 			LeaderId:     rf.me,
 			Entries:      nil,
-			LeaderCommit: rf.commitIndex,
-			PrevLogIndex: rf.commitIndex,
-			PrevLogTerm:  rf.log[rf.commitIndex-rf.offset].Term,
+			LeaderCommit: commitIndex,
+			PrevLogIndex: commitIndex,
+			// PrevLogTerm:  rf.log[commitIndex-rf.offset].Term,
+			PrevLogTerm: rf.getLogTerm(commitIndex),
 		}
 		rf.newCmd.L.Unlock()
 		rf.applyCmd.L.Unlock()
