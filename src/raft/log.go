@@ -34,11 +34,15 @@ func (rf *Raft) applyLog() {
 			rf.newCmd.L.Lock()
 			for rf.lastApplied < rf.commitIndex {
 				rf.lastApplied++
-				rf.apply <- ApplyMsg{
+				msg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log[rf.lastApplied-rf.offset].Command,
 					CommandIndex: rf.lastApplied,
 				}
+				// release newCmd while waiting for sending message to channel
+				rf.newCmd.L.Unlock()
+				rf.apply <- msg
+				rf.newCmd.L.Lock()
 			}
 			rf.newCmd.L.Unlock()
 			rf.debug("applied log[%d:%d]", last+1, rf.lastApplied+1)

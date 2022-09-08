@@ -97,7 +97,8 @@ type Raft struct {
 	matchIndex []int
 
 	/* -----State----- */
-
+	snapshotBuf []byte
+	ss          *sync.Mutex
 }
 
 func (rf *Raft) dprintf(logger *log.Logger, fmts string, args ...any) {
@@ -234,12 +235,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = NIL_LEADER
 	rf.log = []LogEntry{{0, nil}}
-	rf.offset = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.offset = 0
+	rf.snapshotBuf = []byte{}
+	rf.ss = &sync.Mutex{}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.offset
+	rf.lastApplied = rf.offset
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
