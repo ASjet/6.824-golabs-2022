@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,9 +69,10 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	timerFire atomic.Bool
-	newCmd    *sync.Cond
-	applyCmd  *sync.Cond
+	timerFire  atomic.Bool
+	logCond    *sync.Cond
+	commitCond *sync.Cond
+	applyMu    sync.Mutex
 
 	/* +++++State+++++ */
 
@@ -82,13 +84,15 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	// hold newCmd lock
+	// hold logCond lock
 	log    []LogEntry
 	offset int
 
 	// Volatile state on all servers
-	// hold applyCmd lock
+	// hold commitCond lock
 	commitIndex int
+
+	// hold applyMu
 	lastApplied int
 
 	// Volatile state on leaders
@@ -157,6 +161,21 @@ func (rf *Raft) trimLog(start, end int) {
 		rf.log = rf.log[:so]
 		return
 	}
+}
+
+func logStr(log []LogEntry, offset int) string {
+	s := strings.Builder{}
+	s.WriteRune('|')
+	for i, l := range log {
+		if i+offset == 0 {
+			continue
+		}
+		s.WriteString(strconv.Itoa(i + offset))
+		s.WriteRune('@')
+		s.WriteString(strconv.Itoa(l.Term))
+		s.WriteRune('|')
+	}
+	return s.String()
 }
 
 func (rf *Raft) dprintf(logger *log.Logger, fmts string, args ...any) {
@@ -233,16 +252,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader := rf.GetState()
 	if isLeader {
 		rf.mu.Lock()
-		rf.newCmd.L.Lock()
-		next := len(rf.log) + rf.offset
+		rf.logCond.L.Lock()
+		next := rf.lastLogIndex() + 1
 		rf.debug("new command %v at log entry %d@%d", command, next, term)
 		rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
-		rf.debug("new log length %d", len(rf.log))
+		rf.debug("new log length %d", len(rf.log)-1)
 		rf.persist()
 		rf.debug("%s", logStr(rf.log, rf.offset))
-		rf.newCmd.L.Unlock()
+		rf.logCond.L.Unlock()
 		rf.mu.Unlock()
-		rf.newCmd.Broadcast()
+		rf.logCond.Broadcast()
 		index = next
 	}
 	return index, term, isLeader
@@ -260,8 +279,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	rf.dead.Store(true)
 	// Your code here, if desired.
-	rf.applyCmd.Broadcast()
-	rf.newCmd.Broadcast()
+	rf.commitCond.Broadcast()
+	rf.logCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -284,8 +303,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.newCmd = sync.NewCond(&sync.Mutex{})
-	rf.applyCmd = sync.NewCond(&sync.Mutex{})
+	rf.logCond = sync.NewCond(&sync.Mutex{})
+	rf.commitCond = sync.NewCond(&sync.Mutex{})
 	rf.apply = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).

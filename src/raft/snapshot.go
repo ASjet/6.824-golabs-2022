@@ -74,26 +74,25 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 	}
 
 	// 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
-	rf.applyCmd.L.Lock()
-	rf.newCmd.L.Lock()
-	// lastIndex := len(rf.log) + rf.offset - 1
+	rf.logCond.L.Lock()
 	lastIndex := rf.lastLogIndex()
 	//  6. If existing log entry has same index and term as snapshot’s last included entry,
 	//     retain log entries following it and reply
 	if lastIndex >= args.LastIndex && rf.log[args.LastIndex-rf.offset].Term == args.LastTerm {
 		rf.debug("trim log[%d:]", args.LastIndex)
 		// keep the log at index as the dummy head which has index 0
-		// rf.log = rf.log[args.LastIndex-rf.offset:]
-		// rf.offset = args.LastIndex
 		rf.trimLog(-1, args.LastIndex)
 		rf.debug("new log length %d", len(rf.log))
 	} else {
 		//  7. Discard the entire log
 		rf.debug("discard entire log, set offset to %d", args.LastIndex)
-		rf.log = []LogEntry{{0, nil}}
+		rf.log = []LogEntry{{args.LastIndex, nil}}
 		rf.debug("new log length %d", len(rf.log))
 		rf.offset = args.LastIndex
 	}
+
+	rf.commitCond.L.Lock()
+	rf.applyMu.Lock()
 
 	rf.persistSnapshot(args.Data)
 	if rf.lastApplied < args.LastIndex {
@@ -103,8 +102,9 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 		rf.commitIndex = args.LastIndex
 	}
 
-	rf.newCmd.L.Unlock()
-	rf.applyCmd.L.Unlock()
+	rf.applyMu.Unlock()
+	rf.commitCond.L.Unlock()
+	rf.logCond.L.Unlock()
 	rf.mu.Unlock()
 
 	//  8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
@@ -126,26 +126,23 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.debug("make snapshot up to index %d", index)
 	rf.mu.Lock()
-	rf.newCmd.L.Lock()
+	// rf.applyCmd.L.Lock()
+	rf.logCond.L.Lock()
 
-	// last := len(rf.log) - 1 + rf.offset
 	last := rf.lastLogIndex()
 	if last < index {
 		rf.debug("snapshot index is higher than last, expect at most %d, got %d",
 			last, index)
 	} else {
-		// rf.log = rf.log[index-rf.offset:]
+		rf.debug("discard log[:%d]([:%d])", index, index-rf.offset)
 		rf.trimLog(-1, index)
-		rf.debug("discarded log[:%d]([:%d])", index, index-rf.offset)
-		rf.debug("new log length %d", len(rf.log))
-		// rf.offset = index
+		rf.debug("new log length %d", len(rf.log)-1)
 		rf.debug("%s", logStr(rf.log, rf.offset))
 		rf.persistSnapshot(snapshot)
 	}
 
-	rf.newCmd.L.Unlock()
+	rf.logCond.L.Unlock()
+	// rf.applyCmd.L.Unlock()
 	rf.mu.Unlock()
 
 }
-
-// FIX the length of log may be 0 which should at lease be 1

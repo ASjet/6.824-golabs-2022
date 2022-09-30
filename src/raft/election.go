@@ -11,7 +11,7 @@ const (
 	FOLLOWER
 	CANDIDATE
 	NIL_LEADER               = -1
-	ELECTION_TIMEOUT_MINIMUM = 200 // ms
+	ELECTION_TIMEOUT_MINIMUM = 300 // ms
 	ELECTION_TIMEOUT_SPAN    = 300 // ms
 	HEARTBEAT_INTERVAL       = 150 //ms
 )
@@ -81,11 +81,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	rf.newCmd.L.Lock()
-	defer rf.newCmd.L.Unlock()
+	rf.logCond.L.Lock()
+	defer rf.logCond.L.Unlock()
 	oldTerm := rf.currentTerm
-	// lastIndex := len(rf.log) - 1 + rf.offset
-	// lastTerm := rf.log[lastIndex-rf.offset].Term
 	lastIndex := rf.lastLogIndex()
 	lastTerm := rf.getLogTerm(lastIndex)
 	rf.debug("LastLog: candidate: %d@%d, local: %d@%d",
@@ -135,7 +133,7 @@ func (rf *Raft) follow(leader, term int) {
 	rf.isLeader.Store(false)
 
 	// wake all agreementWith goroutine to exit
-	rf.newCmd.Broadcast()
+	rf.logCond.Broadcast()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -182,13 +180,11 @@ func (rf *Raft) ticker() {
 func (rf *Raft) newElection() {
 	// Init candidate state
 	rf.mu.Lock()
-	rf.newCmd.L.Lock()
+	rf.logCond.L.Lock()
 	rf.follow(rf.me, rf.currentTerm+1)
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-		// LastLogIndex: len(rf.log) - 1 + rf.offset,
-		// LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
 		LastLogIndex: rf.lastLogIndex(),
 		LastLogTerm:  rf.getLogTerm(-1),
 	}
@@ -196,7 +192,7 @@ func (rf *Raft) newElection() {
 		rf.currentTerm, args.LastLogIndex, args.LastLogTerm)
 	rf.debug("%s", logStr(rf.log, rf.offset))
 	rf.persist()
-	rf.newCmd.L.Unlock()
+	rf.logCond.L.Unlock()
 	rf.mu.Unlock()
 
 	ch := make(chan Vote, len(rf.peers))
@@ -220,10 +216,10 @@ func (rf *Raft) newElection() {
 				} else if args.Term < reply.Term {
 					// Stale, convert to follower
 					rf.mu.Lock()
-					rf.newCmd.L.Lock()
+					rf.logCond.L.Lock()
 					rf.follow(NIL_LEADER, reply.Term)
 					rf.persist()
-					rf.newCmd.L.Unlock()
+					rf.logCond.L.Unlock()
 					rf.mu.Unlock()
 					ch <- Vote{-1, index}
 				} else {
@@ -307,8 +303,8 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 
 func (rf *Raft) sendHeartbeat(term int) {
 	for rf.isLeader.Load() && !rf.killed() {
-		rf.applyCmd.L.Lock()
-		rf.newCmd.L.Lock()
+		rf.commitCond.L.Lock()
+		rf.logCond.L.Lock()
 		commitIndex := rf.commitIndex
 		// if commited index is smaller than offset, send offset
 		if commitIndex < rf.offset {
@@ -320,11 +316,10 @@ func (rf *Raft) sendHeartbeat(term int) {
 			Entries:      nil,
 			LeaderCommit: commitIndex,
 			PrevLogIndex: commitIndex,
-			// PrevLogTerm:  rf.log[commitIndex-rf.offset].Term,
-			PrevLogTerm: rf.getLogTerm(commitIndex),
+			PrevLogTerm:  rf.getLogTerm(commitIndex),
 		}
-		rf.newCmd.L.Unlock()
-		rf.applyCmd.L.Unlock()
+		rf.logCond.L.Unlock()
+		rf.commitCond.L.Unlock()
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
@@ -338,9 +333,9 @@ func (rf *Raft) sendHeartbeat(term int) {
 						rf.warn("stale term %d, latest %d, convert to follower",
 							args.Term, reply.Term)
 						rf.follow(NIL_LEADER, reply.Term)
-						rf.newCmd.L.Lock()
+						rf.logCond.L.Lock()
 						rf.persist()
-						rf.newCmd.L.Unlock()
+						rf.logCond.L.Unlock()
 					}
 					rf.mu.Unlock()
 				}
