@@ -11,9 +11,9 @@ const (
 	FOLLOWER
 	CANDIDATE
 	NIL_LEADER               = -1
-	ELECTION_TIMEOUT_MINIMUM = 200 // ms
+	HEARTBEAT_INTERVAL       = 250 //ms
+	ELECTION_TIMEOUT_MINIMUM = 300 // ms
 	ELECTION_TIMEOUT_SPAN    = 200 // ms
-	HEARTBEAT_INTERVAL       = 150 //ms
 )
 
 type State int

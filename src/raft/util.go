@@ -7,7 +7,7 @@ import (
 
 // Debugging
 const (
-	DEBUG     = true
+	DEBUG     = false
 	LOG_LEVEL = 4
 )
 
