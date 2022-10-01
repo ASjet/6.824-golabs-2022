@@ -105,13 +105,17 @@ type Raft struct {
 }
 
 func (rf *Raft) getLog(index int) (int, interface{}) {
-	var log LogEntry
+	var l LogEntry
+	i := index - rf.offset
 	if index < 0 {
-		log = rf.log[len(rf.log)+index]
-	} else {
-		log = rf.log[index-rf.offset]
+		i = len(rf.log) + index
 	}
-	return log.Term, log.Command
+	if i < 0 {
+		log.Panicf("invalid log index %d, offset: %d, log len: %d",
+			index, rf.offset, len(rf.log))
+	}
+	l = rf.log[i]
+	return l.Term, l.Command
 }
 
 func (rf *Raft) getLogTerm(index int) int {
@@ -165,15 +169,17 @@ func (rf *Raft) trimLog(start, end int) {
 
 func logStr(log []LogEntry, offset int) string {
 	s := strings.Builder{}
-	s.WriteRune('|')
-	for i, l := range log {
-		if i+offset == 0 {
-			continue
-		}
-		s.WriteString(strconv.Itoa(i + offset))
-		s.WriteRune('@')
-		s.WriteString(strconv.Itoa(l.Term))
+	if DEBUG {
 		s.WriteRune('|')
+		for i, l := range log {
+			if i+offset == 0 {
+				continue
+			}
+			s.WriteString(strconv.Itoa(i + offset))
+			s.WriteRune('@')
+			s.WriteString(strconv.Itoa(l.Term))
+			s.WriteRune('|')
+		}
 	}
 	return s.String()
 }

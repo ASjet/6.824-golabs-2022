@@ -42,19 +42,58 @@ func (rf *Raft) sendInstallSnapshot(server int, args *SnapshotArgs,
 	return ok
 }
 
-//  1. Reply immediately if term < currentTerm
-//  2. Create new snapshot file if first chunk (offset is 0)
-//  3. Write data into snapshot file at given offset(don't implement offset)
-//  4. Reply and wait for more data chunks if done is false
-//  5. Save snapshot file, discard any existing or partial snapshot with a smaller index
-//  6. If existing log entry has same index and term as snapshot’s last included entry,
-//     retain log entries following it and reply
-//  7. Discard the entire log
-//  8. Reset state machine using snapshot contents (and load snapshot’s cluster configuration)
-//
+func (rf *Raft) sendSnapshot(term, index, last, next int) (bool, ReplicaLog) {
+	args := SnapshotArgs{
+		Term:      term,
+		LeaderId:  rf.me,
+		LastIndex: rf.offset,
+		LastTerm:  rf.getLogTerm(rf.offset),
+		Offset:    0,
+		Data:      rf.persister.ReadSnapshot(),
+		Done:      true,
+	}
+	reply := SnapshotReply{}
+	rf.debug("send snapshot %d@%d to follower %d",
+		args.LastIndex, args.LastTerm, index)
+	rf.logCond.L.Unlock()
+	if !rf.sendInstallSnapshot(index, &args, &reply) {
+		if rf.isLeader.Load() {
+			// Failed to issue RPC, retry
+			rf.warn("failed to send installSnapshot to follower %d, retring...", index)
+		}
+		return false, ReplicaLog{}
+	}
+	curterm, isleader := rf.GetState()
+	if curterm > term || !isleader {
+		// stale term
+		return false, ReplicaLog{}
+	}
+	if reply.Term > args.Term {
+		// Stale leader
+		rf.mu.Lock()
+		if rf.isLeader.Load() {
+			rf.warn("stale term %d, latest %d, convert to follower",
+				args.Term, reply.Term)
+			rf.follow(NIL_LEADER, reply.Term)
+			rf.logCond.L.Lock()
+			rf.persist()
+			rf.logCond.L.Unlock()
+		}
+		rf.mu.Unlock()
+		return false, ReplicaLog{}
+	}
+
+	rf.info("update nextIndex[%d] from %d to %d @%d",
+		index, next, last+1, term)
+	// Update follower records
+	rf.nextIndex[index].Store(int32(last + 1))
+	return true, ReplicaLog{last, index}
+}
+
 // This is a RPC call
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
-	rf.debug("receive snapshot from leader %d @%d", args.LeaderId, args.Term)
+	rf.debug("receive snapshot([:%d]) from leader %d @%d",
+		args.LastIndex+1, args.LeaderId, args.Term)
 
 	curterm, isleader := rf.GetState()
 	reply.Term = curterm
@@ -75,32 +114,38 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 
 	// 5. Save snapshot file, discard any existing or partial snapshot with a smaller index
 	rf.logCond.L.Lock()
+
+	if args.LastIndex < rf.offset {
+		rf.logCond.L.Unlock()
+		rf.mu.Unlock()
+		return
+	}
+
 	lastIndex := rf.lastLogIndex()
+	rf.debug("currtne log length %d, offset %d", len(rf.log), rf.offset)
 	//  6. If existing log entry has same index and term as snapshot’s last included entry,
 	//     retain log entries following it and reply
-	if lastIndex >= args.LastIndex && rf.log[args.LastIndex-rf.offset].Term == args.LastTerm {
-		rf.debug("trim log[%d:]", args.LastIndex)
+	if lastIndex >= args.LastIndex && rf.getLogTerm(args.LastIndex) == args.LastTerm {
+		rf.debug("trim log[:%d]", args.LastIndex)
 		// keep the log at index as the dummy head which has index 0
 		rf.trimLog(-1, args.LastIndex)
 		rf.debug("new log length %d", len(rf.log))
 	} else {
 		//  7. Discard the entire log
-		rf.debug("discard entire log, set offset to %d", args.LastIndex)
-		rf.log = []LogEntry{{args.LastIndex, nil}}
+		rf.debug("discard entire log")
+		rf.log = []LogEntry{{args.LastTerm, nil}}
 		rf.debug("new log length %d", len(rf.log))
 		rf.offset = args.LastIndex
 	}
+
+	rf.debug("set offset to %d", args.LastIndex)
 
 	rf.commitCond.L.Lock()
 	rf.applyMu.Lock()
 
 	rf.persistSnapshot(args.Data)
-	if rf.lastApplied < args.LastIndex {
-		rf.lastApplied = args.LastIndex
-	}
-	if rf.commitIndex < args.LastIndex {
-		rf.commitIndex = args.LastIndex
-	}
+	rf.lastApplied = args.LastIndex
+	rf.commitIndex = args.LastIndex
 
 	rf.applyMu.Unlock()
 	rf.commitCond.L.Unlock()
@@ -126,13 +171,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.debug("make snapshot up to index %d", index)
 	rf.mu.Lock()
-	// rf.applyCmd.L.Lock()
 	rf.logCond.L.Lock()
 
 	last := rf.lastLogIndex()
 	if last < index {
-		rf.debug("snapshot index is higher than last, expect at most %d, got %d",
+		rf.warn("snapshot index is higher than last, expect at most %d, got %d",
 			last, index)
+		rf.commitCond.L.Lock()
+		rf.applyMu.Lock()
+		rf.debug("discard entire log")
+		rf.log = []LogEntry{{rf.currentTerm, nil}}
+		rf.offset = index
+		rf.lastApplied = index
+		rf.commitIndex = index
+		rf.applyMu.Unlock()
+		rf.commitCond.L.Unlock()
+		rf.persistSnapshot(snapshot)
 	} else {
 		rf.debug("discard log[:%d]([:%d])", index, index-rf.offset)
 		rf.trimLog(-1, index)
@@ -142,7 +196,5 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	rf.logCond.L.Unlock()
-	// rf.applyCmd.L.Unlock()
 	rf.mu.Unlock()
-
 }

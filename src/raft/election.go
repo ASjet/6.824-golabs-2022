@@ -11,8 +11,8 @@ const (
 	FOLLOWER
 	CANDIDATE
 	NIL_LEADER               = -1
-	ELECTION_TIMEOUT_MINIMUM = 300 // ms
-	ELECTION_TIMEOUT_SPAN    = 300 // ms
+	ELECTION_TIMEOUT_MINIMUM = 200 // ms
+	ELECTION_TIMEOUT_SPAN    = 200 // ms
 	HEARTBEAT_INTERVAL       = 150 //ms
 )
 
@@ -270,12 +270,6 @@ func (rf *Raft) rollVote(ch chan Vote, term int) {
 			rf.warn("no reply from server %d @%d", v.Server, term)
 		}
 	}
-
-	// Drain the channel
-	go func() {
-		for range ch {
-		}
-	}()
 
 	// Count result
 	rf.mu.Lock()
