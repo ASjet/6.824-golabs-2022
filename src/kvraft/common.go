@@ -6,7 +6,10 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 )
 
-type Err string
+type GetArgs struct {
+	Key string
+	// You'll have to add definitions here.
+}
 
 // Put or Append
 type PutAppendArgs struct {
@@ -18,16 +21,8 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 }
 
-type PutAppendReply struct {
-	Err Err
-}
-
-type GetArgs struct {
-	Key string
-	// You'll have to add definitions here.
-}
-
-type GetReply struct {
-	Err   Err
-	Value string
+type RequestReply struct {
+	Value     string
+	Err       string
+	CurLeader int
 }
