@@ -273,6 +273,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) State() (int, State) {
+	rf.mu.Lock()
+	leader := rf.votedFor
+	state := rf.state
+	rf.mu.Unlock()
+	if leader == NIL_LEADER {
+		state = CANDIDATE
+	}
+	return leader, state
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the

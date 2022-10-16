@@ -123,7 +123,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Op:    op,
 	}
 	reply := RequestReply{}
-	ck.debug("{%q:%q}", key, value)
+	ck.debug("%s{%q:%q}", op, key, value)
 	ck.Call("KVServer.PutAppend", &args, &reply)
 }
 

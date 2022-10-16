@@ -32,6 +32,14 @@ type Op struct {
 	Value string
 }
 
+func (o Op) String() string {
+	if o.Type == "Get" {
+		return fmt.Sprintf("%s %q", o.Type, o.Key)
+	} else {
+		return fmt.Sprintf("%s{%q:%q}", o.Type, o.Key, o.Value)
+	}
+}
+
 type Msg struct {
 	ok    bool
 	value string
@@ -105,7 +113,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *RequestReply) {
 			Type: "Get",
 			Key:  args.Key,
 		}
-		kv.debug("actuire cond")
 		kv.cond.L.Lock()
 		index, _, _ := kv.rf.Start(op)
 		var m *Msg
@@ -137,12 +144,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *RequestReply) {
 	if leader != kv.me {
 		kv.servers[leader].Call("KVServer.PutAppend", args, reply)
 	} else {
-		kv.debug("{%q:%q}", args.Key, args.Value)
+		kv.debug("%s{%q:%q}", args.Op, args.Key, args.Value)
 		op := Op{
-			Type: args.Op,
-			Key:  args.Key,
+			Type:  args.Op,
+			Key:   args.Key,
+			Value: args.Value,
 		}
-		kv.debug("actuire cond")
 		kv.cond.L.Lock()
 		index, _, _ := kv.rf.Start(op)
 		for {
@@ -161,7 +168,6 @@ func (kv *KVServer) Applier() {
 		if kv.killed() {
 			break
 		}
-		kv.debug("actuire cond")
 		kv.cond.L.Lock()
 		if m.CommandValid {
 			var value string
@@ -171,6 +177,7 @@ func (kv *KVServer) Applier() {
 			switch op.Type {
 			case "Get":
 				value, ok = kv.db[op.Key]
+				kv.debug("get {%q:%q}", op.Key, value)
 			case "Append":
 				value, ok := kv.db[op.Key]
 				if ok {
@@ -178,8 +185,10 @@ func (kv *KVServer) Applier() {
 				} else {
 					kv.db[op.Key] = op.Value
 				}
+				kv.debug("append %q to %q, now is %q", op.Value, value, kv.db[op.Key])
 			case "Put":
 				kv.db[op.Key] = op.Value
+				kv.debug("put %q to %q", op.Value, op.Key)
 			}
 			kv.applied = &Msg{
 				ok:    ok,

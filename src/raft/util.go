@@ -19,7 +19,7 @@ func init() {
 	if !DEBUG {
 		return
 	}
-	odebug, err := os.Create("debug.log")
+	odebug, err := os.Create("raft.log")
 	if LOG_LEVEL < 1 {
 		debugLogger = log.New(os.Stderr, "DEBUG ", log.Ltime|log.Lmicroseconds|log.Lmsgprefix)
 	} else {
